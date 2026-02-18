@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -eu
+
+CLAUDE_DIR="${HOME}/.claude"
+STATS_CACHE="${CLAUDE_DIR}/stats-cache.json"
+PROJECTS_DIR="${CLAUDE_DIR}/projects"
+
+TODAY=$(date +%Y-%m-%d)
+DOW=$(date +%u)
+DAYS_SINCE_MON=$((DOW - 1))
+WEEK_START=$(date -d "${DAYS_SINCE_MON} days ago" +%Y-%m-%d)
+
+# Defaults
+SESSION_MESSAGES=0
+SESSION_INPUT=0
+SESSION_OUTPUT=0
+SESSION_CACHE_READ=0
+SESSION_CACHE_WRITE=0
+SESSION_TOTAL=0
+WEEK_MESSAGES=0
+WEEK_SESSIONS=0
+WEEK_TOOL_CALLS=0
+WEEK_TOKENS=0
+WEEK_MODELS=""
+ALLTIME_SESSIONS=0
+ALLTIME_MESSAGES=0
+FIRST_SESSION="unknown"
+DAILY="0,0,0,0,0,0,0"
+
+# --- Current Session ---
+# Find the most recently modified session JSONL file
+LATEST_SESSION=""
+if [ -d "$PROJECTS_DIR" ]; then
+    LATEST_SESSION=$(find "$PROJECTS_DIR" -name "*.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d' ' -f2-)
+fi
+
+if [ -n "$LATEST_SESSION" ] && [ -f "$LATEST_SESSION" ]; then
+    # Stream-parse: first jq reads line-by-line, second slurps small usage objects
+    USAGE=$(jq -c 'select(.type == "assistant" and .message.usage != null) | .message.usage' \
+        "$LATEST_SESSION" 2>/dev/null \
+        | jq -s '{
+            messages: length,
+            input: (map(.input_tokens // 0) | add // 0),
+            output: (map(.output_tokens // 0) | add // 0),
+            cache_read: (map(.cache_read_input_tokens // 0) | add // 0),
+            cache_write: (map(.cache_creation_input_tokens // 0) | add // 0)
+        }' 2>/dev/null || echo '{}')
+
+    SESSION_MESSAGES=$(echo "$USAGE" | jq -r '.messages // 0')
+    SESSION_INPUT=$(echo "$USAGE" | jq -r '.input // 0')
+    SESSION_OUTPUT=$(echo "$USAGE" | jq -r '.output // 0')
+    SESSION_CACHE_READ=$(echo "$USAGE" | jq -r '.cache_read // 0')
+    SESSION_CACHE_WRITE=$(echo "$USAGE" | jq -r '.cache_write // 0')
+    SESSION_TOTAL=$((SESSION_INPUT + SESSION_OUTPUT + SESSION_CACHE_READ + SESSION_CACHE_WRITE))
+fi
+
+# --- Weekly & All-time from stats cache ---
+if [ -f "$STATS_CACHE" ]; then
+    # Weekly activity aggregates
+    WEEK_DATA=$(jq --arg start "$WEEK_START" --arg today "$TODAY" '{
+        messages: ([.dailyActivity[]? | select(.date >= $start and .date <= $today) | .messageCount] | add // 0),
+        sessions: ([.dailyActivity[]? | select(.date >= $start and .date <= $today) | .sessionCount] | add // 0),
+        toolCalls: ([.dailyActivity[]? | select(.date >= $start and .date <= $today) | .toolCallCount] | add // 0),
+        tokens: ([.dailyModelTokens[]? | select(.date >= $start and .date <= $today) | .tokensByModel | to_entries | map(.value) | add // 0] | add // 0)
+    }' "$STATS_CACHE" 2>/dev/null || echo '{}')
+
+    WEEK_MESSAGES=$(echo "$WEEK_DATA" | jq -r '.messages // 0')
+    WEEK_SESSIONS=$(echo "$WEEK_DATA" | jq -r '.sessions // 0')
+    WEEK_TOOL_CALLS=$(echo "$WEEK_DATA" | jq -r '.toolCalls // 0')
+    WEEK_TOKENS=$(echo "$WEEK_DATA" | jq -r '.tokens // 0')
+
+    # Model breakdown for the week (raw output to avoid JSON quotes)
+    WEEK_MODELS=$(jq -r --arg start "$WEEK_START" --arg today "$TODAY" '
+        [.dailyModelTokens[]? | select(.date >= $start and .date <= $today) | .tokensByModel | to_entries[]] |
+        group_by(.key) | map("\(.[0].key):\(map(.value) | add)") | join(",")
+    ' "$STATS_CACHE" 2>/dev/null || echo "")
+
+    # Daily token breakdown (Monday=index0 .. Sunday=index6)
+    DAILY_PARTS=()
+    for i in $(seq 0 6); do
+        DAY_DATE=$(date -d "${WEEK_START} + ${i} days" +%Y-%m-%d)
+        if [[ "$DAY_DATE" > "$TODAY" ]]; then
+            DAILY_PARTS+=("0")
+        else
+            DAY_TOKENS=$(jq --arg d "$DAY_DATE" '
+                [.dailyModelTokens[]? | select(.date == $d) | .tokensByModel | to_entries | map(.value) | add // 0] | add // 0
+            ' "$STATS_CACHE" 2>/dev/null || echo 0)
+            DAILY_PARTS+=("${DAY_TOKENS}")
+        fi
+    done
+    DAILY=$(IFS=,; echo "${DAILY_PARTS[*]}")
+
+    # All-time stats
+    ALLTIME_SESSIONS=$(jq -r '.totalSessions // 0' "$STATS_CACHE" 2>/dev/null || echo 0)
+    ALLTIME_MESSAGES=$(jq -r '.totalMessages // 0' "$STATS_CACHE" 2>/dev/null || echo 0)
+    FIRST_SESSION=$(jq -r '.firstSessionDate // "unknown"' "$STATS_CACHE" 2>/dev/null || echo "unknown")
+    FIRST_SESSION="${FIRST_SESSION%%T*}" # Strip time part
+fi
+
+# Output key=value pairs
+echo "SESSION_MESSAGES=${SESSION_MESSAGES}"
+echo "SESSION_INPUT=${SESSION_INPUT}"
+echo "SESSION_OUTPUT=${SESSION_OUTPUT}"
+echo "SESSION_CACHE_READ=${SESSION_CACHE_READ}"
+echo "SESSION_CACHE_WRITE=${SESSION_CACHE_WRITE}"
+echo "SESSION_TOTAL=${SESSION_TOTAL}"
+echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
+echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
+echo "WEEK_TOOL_CALLS=${WEEK_TOOL_CALLS}"
+echo "WEEK_TOKENS=${WEEK_TOKENS}"
+echo "WEEK_MODELS=${WEEK_MODELS}"
+echo "ALLTIME_SESSIONS=${ALLTIME_SESSIONS}"
+echo "ALLTIME_MESSAGES=${ALLTIME_MESSAGES}"
+echo "FIRST_SESSION=${FIRST_SESSION}"
+echo "DAILY=${DAILY}"

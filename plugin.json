@@ -1,0 +1,17 @@
+{
+    "id": "claudeCodeUsage",
+    "name": "Claude Code Usage",
+    "description": "Monitor your Claude Code subscription usage with session and weekly token tracking",
+    "version": "1.0.0",
+    "author": "nicolas",
+    "icon": "monitoring",
+    "type": "widget",
+    "capabilities": ["dankbar-widget"],
+    "component": "./ClaudeCodeUsageWidget.qml",
+    "settings": "./ClaudeCodeUsageSettings.qml",
+    "requires": ["jq"],
+    "permissions": [
+        "settings_read",
+        "settings_write"
+    ]
+}
