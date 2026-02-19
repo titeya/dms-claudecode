@@ -78,7 +78,11 @@ if [ -d "$PROJECTS_DIR" ]; then
         {
             day[$1] += $3
             if ($1 >= week_start) {
-                week_model[$2] += $3
+                family = $2
+                if (index(family, "opus") > 0) family = "opus"
+                else if (index(family, "sonnet") > 0) family = "sonnet"
+                else if (index(family, "haiku") > 0) family = "haiku"
+                week_model[family] += $3
                 week_tokens += $3
                 week_msgs++
                 week_sess[$4] = 1
