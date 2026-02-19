@@ -2,22 +2,26 @@ import QtQuick
 import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
+import "translations.js" as Tr
 
 PluginSettings {
     id: root
     pluginId: "claudeCodeUsage"
 
+    property string lang: Qt.locale().name.split(/[_-]/)[0]
+    function tr(key) { return Tr.tr(key, lang) }
+
     StyledText {
         width: parent.width
-        text: "Claude Code Usage"
+        text: root.tr("Claude Code Usage")
         font.pixelSize: Theme.fontSizeLarge
-        font.weight: Font.Bold
+        font.weight: Font.Medium
         color: Theme.surfaceText
     }
 
     StyledText {
         width: parent.width
-        text: "Monitor your Claude Code subscription usage with session and weekly token tracking."
+        text: root.tr("Monitor your Claude Code subscription usage. Rate limits and subscription tier are detected automatically via the Anthropic API.")
         font.pixelSize: Theme.fontSizeSmall
         color: Theme.surfaceVariantText
         wrapMode: Text.WordWrap
@@ -25,23 +29,12 @@ PluginSettings {
 
     SliderSetting {
         settingKey: "refreshInterval"
-        label: "Refresh Interval"
-        description: "How often to fetch usage data (seconds)"
-        defaultValue: 30
-        minimum: 10
-        maximum: 120
+        label: root.tr("Refresh Interval")
+        description: root.tr("How often to fetch usage data (seconds)")
+        defaultValue: 60
+        minimum: 30
+        maximum: 300
         unit: "s"
         leftIcon: "schedule"
-    }
-
-    SliderSetting {
-        settingKey: "weeklyBudget"
-        label: "Weekly Token Budget"
-        description: "Weekly token target in millions (sets the 100% mark on the progress ring)"
-        defaultValue: 5
-        minimum: 1
-        maximum: 100
-        unit: "M"
-        leftIcon: "data_usage"
     }
 }

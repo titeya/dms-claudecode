@@ -5,61 +5,110 @@ import qs.Common
 import qs.Services
 import qs.Widgets
 import qs.Modules.Plugins
+import "translations.js" as Tr
 
 PluginComponent {
     id: root
 
-    // Settings
-    property int refreshInterval: (pluginData.refreshInterval || 30) * 1000
-    property real weeklyBudget: (pluginData.weeklyBudget || 5) * 1000000
+    // i18n
+    property string lang: Qt.locale().name.split(/[_-]/)[0]
+    function tr(key) { return Tr.tr(key, lang) }
 
-    // Session state
-    property int sessionMessages: 0
-    property real sessionInput: 0
-    property real sessionOutput: 0
-    property real sessionCacheRead: 0
-    property real sessionCacheWrite: 0
-    property real sessionTotal: 0
+    // Rolling 7-day labels (index 0 = 6 days ago, index 6 = today)
+    property var dayLabels: {
+        var frDays = ["Di", "Lu", "Ma", "Me", "Je", "Ve", "Sa"]
+        var enDays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+        var days = lang === "fr" ? frDays : enDays
+        var labels = []
+        var now = new Date()
+        for (var i = 6; i >= 0; i--) {
+            var d = new Date(now.getTime() - i * 86400000)
+            labels.push(days[d.getDay()])
+        }
+        return labels
+    }
+
+    // Settings
+    property int refreshInterval: (pluginData.refreshInterval || 60) * 1000
+
+    // API usage data
+    property string subscriptionType: ""
+    property string rateLimitTier: ""
+    property real fiveHourUtil: 0
+    property string fiveHourReset: ""
+    property real sevenDayUtil: 0
+    property string sevenDayReset: ""
+    property bool extraUsageEnabled: false
 
     // Weekly state
     property int weekMessages: 0
     property int weekSessions: 0
-    property int weekToolCalls: 0
     property real weekTokens: 0
+
+    // Monthly state
+    property real monthTokens: 0
 
     // All-time state
     property int alltimeSessions: 0
     property int alltimeMessages: 0
     property string firstSession: ""
 
-    // Daily breakdown (Mon..Sun)
+    // Daily breakdown (rolling 7 days, computed from JSONL files)
     property var dailyTokens: [0, 0, 0, 0, 0, 0, 0]
 
     // Model list
     ListModel { id: modelListData }
 
-    // Adjusted daily: supplement today with live session tokens
-    property int todayIndex: (new Date().getDay() + 6) % 7
-    property var adjustedDaily: {
-        var arr = dailyTokens.slice()
-        arr[todayIndex] = arr[todayIndex] + sessionInput + sessionOutput
-        return arr
-    }
+    // Today is always the last element in rolling 7-day window
+    property int todayIndex: 6
 
     // Derived
-    property real weeklyPercent: weeklyBudget > 0 ? Math.min((weekTokens + sessionInput + sessionOutput) / weeklyBudget * 100, 100) : 0
-    property real maxDaily: Math.max.apply(null, adjustedDaily) || 1
+    property real maxDaily: Math.max.apply(null, dailyTokens) || 1
     property bool isLoading: true
+
+    // Live countdown
+    property real countdownNow: Date.now()
+
+    property string fiveHourCountdown: {
+        if (!fiveHourReset) return ""
+        var resetMs = new Date(fiveHourReset).getTime()
+        var remaining = Math.max(0, resetMs - countdownNow)
+        if (remaining <= 0) return tr("Resetting...")
+        var hours = Math.floor(remaining / 3600000)
+        var mins = Math.floor((remaining % 3600000) / 60000)
+        return hours + "h " + (mins < 10 ? "0" : "") + mins + "m"
+    }
+
+    property string sevenDayCountdown: {
+        if (!sevenDayReset) return ""
+        var resetMs = new Date(sevenDayReset).getTime()
+        var remaining = Math.max(0, resetMs - countdownNow)
+        if (remaining <= 0) return tr("Resetting...")
+        var days = Math.floor(remaining / 86400000)
+        var hours = Math.floor((remaining % 86400000) / 3600000)
+        var mins = Math.floor((remaining % 3600000) / 60000)
+        if (days > 0) return days + "d " + hours + "h " + (mins < 10 ? "0" : "") + mins + "m"
+        return hours + "h " + (mins < 10 ? "0" : "") + mins + "m"
+    }
+
+    Timer {
+        interval: 60000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.countdownNow = Date.now()
+    }
 
     // Script path via PluginService
     property string scriptPath: PluginService.pluginDirectory + "/claudeCodeUsage/get-claude-usage"
 
     popoutWidth: 380
-    popoutHeight: 560
+    popoutHeight: 660
 
     // --- Helpers ---
 
     function formatTokens(n) {
+        if (n >= 1000000000) return (n / 1000000000).toFixed(1) + "B"
         if (n >= 1000000) return (n / 1000000).toFixed(1) + "M"
         if (n >= 1000) return (n / 1000).toFixed(1) + "K"
         return Math.round(n).toString()
@@ -78,6 +127,14 @@ PluginComponent {
         return Theme.primary
     }
 
+    function formatTier(tier) {
+        if (tier.indexOf("max_20x") >= 0) return "Max 20x"
+        if (tier.indexOf("max_5x") >= 0) return "Max 5x"
+        if (tier.indexOf("pro") >= 0) return "Pro"
+        if (tier.indexOf("free") >= 0) return "Free"
+        return tier
+    }
+
     function parseLine(line) {
         var idx = line.indexOf("=")
         if (idx < 0) return
@@ -85,16 +142,17 @@ PluginComponent {
         var val = line.substring(idx + 1)
 
         switch (key) {
-        case "SESSION_MESSAGES": sessionMessages = parseInt(val) || 0; break
-        case "SESSION_INPUT": sessionInput = parseFloat(val) || 0; break
-        case "SESSION_OUTPUT": sessionOutput = parseFloat(val) || 0; break
-        case "SESSION_CACHE_READ": sessionCacheRead = parseFloat(val) || 0; break
-        case "SESSION_CACHE_WRITE": sessionCacheWrite = parseFloat(val) || 0; break
-        case "SESSION_TOTAL": sessionTotal = parseFloat(val) || 0; break
+        case "SUBSCRIPTION_TYPE": subscriptionType = val; break
+        case "RATE_LIMIT_TIER": rateLimitTier = val; break
+        case "FIVE_HOUR_UTIL": fiveHourUtil = parseFloat(val) || 0; break
+        case "FIVE_HOUR_RESET": fiveHourReset = val; break
+        case "SEVEN_DAY_UTIL": sevenDayUtil = parseFloat(val) || 0; break
+        case "SEVEN_DAY_RESET": sevenDayReset = val; break
+        case "EXTRA_USAGE_ENABLED": extraUsageEnabled = (val === "true"); break
         case "WEEK_MESSAGES": weekMessages = parseInt(val) || 0; break
         case "WEEK_SESSIONS": weekSessions = parseInt(val) || 0; break
-        case "WEEK_TOOL_CALLS": weekToolCalls = parseInt(val) || 0; break
         case "WEEK_TOKENS": weekTokens = parseFloat(val) || 0; break
+        case "MONTH_TOKENS": monthTokens = parseFloat(val) || 0; break
         case "ALLTIME_SESSIONS": alltimeSessions = parseInt(val) || 0; break
         case "ALLTIME_MESSAGES": alltimeMessages = parseInt(val) || 0; break
         case "FIRST_SESSION": firstSession = val; break
@@ -141,11 +199,12 @@ PluginComponent {
         repeat: true
         triggeredOnStart: true
         onTriggered: {
-            usageProcess.running = true
+            if (!usageProcess.running)
+                usageProcess.running = true
         }
     }
 
-    // --- Taskbar pills ---
+    // --- Taskbar pills (show 5h utilization) ---
 
     horizontalBarPill: Component {
         Row {
@@ -158,7 +217,7 @@ PluginComponent {
                 anchors.verticalCenter: parent.verticalCenter
                 renderStrategy: Canvas.Cooperative
 
-                property real percent: root.weeklyPercent
+                property real percent: root.fiveHourUtil
                 onPercentChanged: requestPaint()
 
                 onPaint: {
@@ -185,7 +244,7 @@ PluginComponent {
             }
 
             StyledText {
-                text: root.formatTokens(root.weekTokens + root.sessionInput + root.sessionOutput)
+                text: Math.round(root.fiveHourUtil) + "%"
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
                 anchors.verticalCenter: parent.verticalCenter
@@ -204,7 +263,7 @@ PluginComponent {
                 anchors.horizontalCenter: parent.horizontalCenter
                 renderStrategy: Canvas.Cooperative
 
-                property real percent: root.weeklyPercent
+                property real percent: root.fiveHourUtil
                 onPercentChanged: requestPaint()
 
                 onPaint: {
@@ -231,7 +290,7 @@ PluginComponent {
             }
 
             StyledText {
-                text: root.formatTokens(root.weekTokens + root.sessionInput + root.sessionOutput)
+                text: Math.round(root.fiveHourUtil) + "%"
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -243,146 +302,316 @@ PluginComponent {
 
     popoutContent: Component {
         PopoutComponent {
-            headerText: "Claude Code Usage"
-            detailsText: "Cloud subscription monitor"
+            headerText: root.tr("Claude Code Usage")
+            detailsText: root.rateLimitTier ? root.tr("Subscription") + " : " + root.formatTier(root.rateLimitTier) : ""
             showCloseButton: true
 
             Column {
-                width: parent.width
-                spacing: Theme.spacingM
+                width: parent.width - Theme.spacingM * 2
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: Theme.spacingL
 
-                // --- Weekly overview with large ring ---
-                Item {
+                // --- 5h Rate Window card ---
+                StyledRect {
                     width: parent.width
-                    height: 120
+                    height: fiveHourContent.implicitHeight + Theme.spacingS * 2
+                    color: Theme.surfaceContainerHigh
 
-                    Canvas {
-                        id: popoutRing
-                        width: 100
-                        height: 100
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.left: parent.left
-                        anchors.leftMargin: Theme.spacingS
-                        renderStrategy: Canvas.Cooperative
+                    Row {
+                        id: fiveHourContent
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingS
+                        spacing: Theme.spacingM
 
-                        property real percent: root.weeklyPercent
-                        onPercentChanged: requestPaint()
+                        Canvas {
+                            id: fiveHourRing
+                            width: 100
+                            height: 100
+                            anchors.verticalCenter: parent.verticalCenter
+                            renderStrategy: Canvas.Cooperative
 
-                        onPaint: {
-                            var ctx = getContext("2d")
-                            ctx.reset()
-                            var cx = width / 2, cy = height / 2, r = 38, lw = 8
+                            property real percent: root.fiveHourUtil
+                            onPercentChanged: requestPaint()
 
-                            ctx.beginPath()
-                            ctx.arc(cx, cy, r, 0, 2 * Math.PI)
-                            ctx.lineWidth = lw
-                            ctx.strokeStyle = Theme.surfaceVariant
-                            ctx.stroke()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.reset()
+                                var cx = width / 2, cy = height / 2, r = 38, lw = 8
 
-                            var pct = percent / 100
-                            if (pct > 0) {
                                 ctx.beginPath()
-                                ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(pct, 1))
+                                ctx.arc(cx, cy, r, 0, 2 * Math.PI)
                                 ctx.lineWidth = lw
-                                ctx.strokeStyle = root.progressColor(percent)
-                                ctx.lineCap = "round"
+                                ctx.strokeStyle = Theme.surfaceVariant
                                 ctx.stroke()
+
+                                var pct = percent / 100
+                                if (pct > 0) {
+                                    ctx.beginPath()
+                                    ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(pct, 1))
+                                    ctx.lineWidth = lw
+                                    ctx.strokeStyle = root.progressColor(percent)
+                                    ctx.lineCap = "round"
+                                    ctx.stroke()
+                                }
+                            }
+
+                            StyledText {
+                                anchors.centerIn: parent
+                                text: Math.round(root.fiveHourUtil) + "%"
+                                font.pixelSize: Theme.fontSizeXLarge
+                                font.weight: Font.DemiBold
+                                color: Theme.surfaceText
                             }
                         }
 
-                        StyledText {
-                            anchors.centerIn: parent
-                            text: Math.round(root.weeklyPercent) + "%"
-                            font.pixelSize: Theme.fontSizeXLarge
-                            font.weight: Font.Bold
-                            color: Theme.surfaceText
-                        }
-                    }
+                        Column {
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Theme.spacingS
 
-                    Column {
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.left: popoutRing.right
-                        anchors.leftMargin: Theme.spacingM
-                        anchors.right: parent.right
-                        spacing: Theme.spacingXS
-
-                        StyledText {
-                            text: "This Week"
-                            font.pixelSize: Theme.fontSizeMedium
-                            font.weight: Font.Bold
-                            color: Theme.surfaceText
-                        }
-                        StyledText {
-                            text: root.formatTokens(root.weekTokens + root.sessionInput + root.sessionOutput) + " tokens"
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.primary
-                        }
-                        StyledText {
-                            text: root.weekSessions + " sessions · " + root.weekMessages + " msgs"
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
-                        }
-                        StyledText {
-                            text: root.weekToolCalls + " tool calls"
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
+                            StyledText {
+                                text: root.tr("5h Rate Window")
+                                font.pixelSize: Theme.fontSizeMedium
+                                font.weight: Font.Medium
+                                color: Theme.surfaceText
+                            }
+                            StyledText {
+                                text: Math.round(root.fiveHourUtil) + "% " + root.tr("used")
+                                font.pixelSize: Theme.fontSizeMedium
+                                color: root.progressColor(root.fiveHourUtil)
+                            }
+                            StyledText {
+                                text: root.fiveHourCountdown ? root.tr("Resets in") + " " + root.fiveHourCountdown : ""
+                                font.pixelSize: Theme.fontSizeMedium
+                                color: Theme.surfaceVariantText
+                                visible: root.fiveHourCountdown !== ""
+                            }
                         }
                     }
                 }
 
-                // --- Daily activity chart ---
-                Column {
+                // --- 7-Day Usage card ---
+                StyledRect {
                     width: parent.width
-                    spacing: Theme.spacingXS
+                    height: sevenDayContent.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
 
-                    StyledText {
-                        text: "Daily Activity"
-                        font.pixelSize: Theme.fontSizeSmall
-                        font.weight: Font.Bold
-                        color: Theme.surfaceText
-                        leftPadding: Theme.spacingS
+                    Row {
+                        id: sevenDayContent
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingM
+
+                        Canvas {
+                            id: weeklySmallRing
+                            width: 72
+                            height: 72
+                            anchors.verticalCenter: parent.verticalCenter
+                            renderStrategy: Canvas.Cooperative
+
+                            property real percent: root.sevenDayUtil
+                            onPercentChanged: requestPaint()
+
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.reset()
+                                var cx = width / 2, cy = height / 2, r = 28, lw = 6
+
+                                ctx.beginPath()
+                                ctx.arc(cx, cy, r, 0, 2 * Math.PI)
+                                ctx.lineWidth = lw
+                                ctx.strokeStyle = Theme.surfaceVariant
+                                ctx.stroke()
+
+                                var pct = percent / 100
+                                if (pct > 0) {
+                                    ctx.beginPath()
+                                    ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(pct, 1))
+                                    ctx.lineWidth = lw
+                                    ctx.strokeStyle = root.progressColor(percent)
+                                    ctx.lineCap = "round"
+                                    ctx.stroke()
+                                }
+                            }
+
+                            StyledText {
+                                anchors.centerIn: parent
+                                text: Math.round(root.sevenDayUtil) + "%"
+                                font.pixelSize: 14
+                                font.weight: Font.DemiBold
+                                color: Theme.surfaceText
+                            }
+                        }
+
+                        Column {
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Theme.spacingXS
+
+                            StyledText {
+                                text: root.tr("7-Day Usage") + " · " + Math.round(root.sevenDayUtil) + "%"
+                                font.pixelSize: Theme.fontSizeMedium
+                                font.weight: Font.Medium
+                                color: Theme.surfaceText
+                            }
+                            StyledText {
+                                text: {
+                                    var parts = []
+                                    if (root.weekSessions > 0) parts.push(root.weekSessions + " " + root.tr("sessions"))
+                                    if (root.weekMessages > 0) parts.push(root.weekMessages + " " + root.tr("msgs"))
+                                    return parts.join(" · ")
+                                }
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceVariantText
+                            }
+                            StyledText {
+                                text: root.sevenDayCountdown ? root.tr("Resets in") + " " + root.sevenDayCountdown : ""
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceVariantText
+                                visible: root.sevenDayCountdown !== ""
+                            }
+                        }
                     }
+                }
 
-                    StyledRect {
-                        width: parent.width
-                        height: 80
-                        color: Theme.surfaceContainer
+                // --- Token Consumption card ---
+                StyledRect {
+                    width: parent.width
+                    height: consumptionCol.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
+
+                    Column {
+                        id: consumptionCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingM
+
+                        StyledText {
+                            text: root.tr("Token Consumption")
+                            font.pixelSize: Theme.fontSizeMedium
+                            font.weight: Font.Medium
+                            color: Theme.surfaceText
+                        }
 
                         Row {
-                            id: chartRow
-                            anchors.fill: parent
-                            anchors.margins: Theme.spacingS
-                            spacing: 4
+                            width: parent.width
 
-                            Repeater {
-                                model: 7
-                                delegate: Column {
-                                    width: (chartRow.width - 6 * 4) / 7
-                                    height: chartRow.height
-                                    spacing: 2
+                            Column {
+                                width: parent.width / 3
+                                spacing: 4
 
-                                    Item {
-                                        width: parent.width
-                                        height: parent.height - dayLabel.height - 2
+                                StyledText {
+                                    text: root.tr("Today")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatTokens(root.dailyTokens[6])
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.DemiBold
+                                    color: Theme.primary
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
 
-                                        Rectangle {
-                                            anchors.bottom: parent.bottom
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            width: Math.max(parent.width - 4, 4)
-                                            height: root.maxDaily > 0
-                                                ? Math.max(root.adjustedDaily[index] / root.maxDaily * parent.height, root.adjustedDaily[index] > 0 ? 3 : 0)
-                                                : 0
-                                            radius: 2
-                                            color: index === root.todayIndex ? Theme.primary : Theme.surfaceVariant
+                            Column {
+                                width: parent.width / 3
+                                spacing: 4
+
+                                StyledText {
+                                    text: root.tr("Week")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatTokens(root.weekTokens)
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.DemiBold
+                                    color: Theme.surfaceText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+
+                            Column {
+                                width: parent.width / 3
+                                spacing: 4
+
+                                StyledText {
+                                    text: root.tr("Month")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatTokens(root.monthTokens)
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.DemiBold
+                                    color: Theme.surfaceText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- Daily activity card ---
+                StyledRect {
+                    width: parent.width
+                    height: dailyCol.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
+
+                    Column {
+                        id: dailyCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingS
+
+                        StyledText {
+                            text: root.tr("Daily Activity")
+                            font.pixelSize: Theme.fontSizeMedium
+                            font.weight: Font.Medium
+                            color: Theme.surfaceText
+                        }
+
+                        Item {
+                            width: parent.width
+                            height: 70
+
+                            Row {
+                                id: chartRow
+                                anchors.fill: parent
+                                spacing: 4
+
+                                Repeater {
+                                    model: 7
+                                    delegate: Column {
+                                        width: (chartRow.width - 6 * 4) / 7
+                                        height: chartRow.height
+                                        spacing: 2
+
+                                        Item {
+                                            width: parent.width
+                                            height: parent.height - dayLabel.height - 2
+
+                                            Rectangle {
+                                                anchors.bottom: parent.bottom
+                                                anchors.horizontalCenter: parent.horizontalCenter
+                                                width: Math.max(parent.width - 4, 4)
+                                                height: root.maxDaily > 0
+                                                    ? Math.max(root.dailyTokens[index] / root.maxDaily * parent.height, root.dailyTokens[index] > 0 ? 3 : 0)
+                                                    : 0
+                                                radius: 2
+                                                color: index === root.todayIndex ? Theme.primary : Theme.surfaceVariant
+                                            }
                                         }
-                                    }
 
-                                    StyledText {
-                                        id: dayLabel
-                                        text: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"][index]
-                                        font.pixelSize: 10
-                                        color: index === root.todayIndex ? Theme.primary : Theme.surfaceVariantText
-                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        StyledText {
+                                            id: dayLabel
+                                            text: root.dayLabels[index]
+                                            font.pixelSize: 11
+                                            color: index === root.todayIndex ? Theme.primary : Theme.surfaceVariantText
+                                            anchors.horizontalCenter: parent.horizontalCenter
+                                        }
                                     }
                                 }
                             }
@@ -390,83 +619,36 @@ PluginComponent {
                     }
                 }
 
-                // --- Current session ---
-                Column {
+                // --- Model breakdown card ---
+                StyledRect {
                     width: parent.width
-                    spacing: Theme.spacingXS
-
-                    StyledText {
-                        text: "Current Session"
-                        font.pixelSize: Theme.fontSizeSmall
-                        font.weight: Font.Bold
-                        color: Theme.surfaceText
-                        leftPadding: Theme.spacingS
-                    }
-
-                    StyledRect {
-                        width: parent.width
-                        height: sessionGrid.implicitHeight + Theme.spacingS * 2
-                        color: Theme.surfaceContainer
-
-                        Grid {
-                            id: sessionGrid
-                            anchors.fill: parent
-                            anchors.margins: Theme.spacingS
-                            columns: 2
-                            columnSpacing: Theme.spacingM
-                            rowSpacing: Theme.spacingXS
-
-                            StyledText { text: "Messages"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                            StyledText { text: root.sessionMessages.toString(); font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
-
-                            StyledText { text: "Input"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                            StyledText { text: root.formatTokens(root.sessionInput); font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
-
-                            StyledText { text: "Output"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                            StyledText { text: root.formatTokens(root.sessionOutput); font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
-
-                            StyledText { text: "Cache read"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                            StyledText { text: root.formatTokens(root.sessionCacheRead); font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
-
-                            StyledText { text: "Cache write"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
-                            StyledText { text: root.formatTokens(root.sessionCacheWrite); font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
-
-                            StyledText { text: "Total"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText; font.weight: Font.Bold }
-                            StyledText { text: root.formatTokens(root.sessionTotal); font.pixelSize: Theme.fontSizeSmall; color: Theme.primary; font.weight: Font.Bold }
-                        }
-                    }
-                }
-
-                // --- Model breakdown ---
-                Column {
-                    width: parent.width
-                    spacing: Theme.spacingXS
+                    height: modelCardCol.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
                     visible: modelListData.count > 0
 
-                    StyledText {
-                        text: "Models This Week"
-                        font.pixelSize: Theme.fontSizeSmall
-                        font.weight: Font.Bold
-                        color: Theme.surfaceText
-                        leftPadding: Theme.spacingS
-                    }
+                    Column {
+                        id: modelCardCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingS
 
-                    StyledRect {
-                        width: parent.width
-                        height: modelCol.implicitHeight + Theme.spacingS * 2
-                        color: Theme.surfaceContainer
+                        StyledText {
+                            text: root.tr("Models This Week")
+                            font.pixelSize: Theme.fontSizeMedium
+                            font.weight: Font.Medium
+                            color: Theme.surfaceText
+                        }
 
                         Column {
                             id: modelCol
-                            anchors.fill: parent
-                            anchors.margins: Theme.spacingS
-                            spacing: Theme.spacingXS
+                            width: parent.width
+                            spacing: Theme.spacingS
 
                             Repeater {
                                 model: modelListData
                                 delegate: Column {
-                                    width: modelCol.width - Theme.spacingS * 2
-                                    spacing: 2
+                                    width: modelCol.width
+                                    spacing: 3
 
                                     Row {
                                         width: parent.width
@@ -505,32 +687,39 @@ PluginComponent {
                     }
                 }
 
-                // --- All-time footer ---
-                Row {
+                // --- All-time footer card ---
+                StyledRect {
                     width: parent.width
-                    leftPadding: Theme.spacingS
-                    spacing: Theme.spacingXS
+                    height: allTimeRow.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
 
-                    DankIcon {
-                        name: "calendar_today"
-                        size: 14
-                        color: Theme.surfaceVariantText
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
+                    Row {
+                        id: allTimeRow
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingS
 
-                    StyledText {
-                        text: {
-                            var parts = []
-                            if (root.firstSession && root.firstSession !== "unknown")
-                                parts.push("Since " + root.firstSession)
-                            parts.push(root.alltimeSessions + " sessions")
-                            parts.push(root.alltimeMessages.toLocaleString() + " msgs")
-                            return parts.join("  ·  ")
+                        DankIcon {
+                            name: "calendar_today"
+                            size: 14
+                            color: Theme.surfaceVariantText
+                            anchors.verticalCenter: parent.verticalCenter
                         }
-                        font.pixelSize: 11
-                        color: Theme.surfaceVariantText
-                        wrapMode: Text.WordWrap
-                        anchors.verticalCenter: parent.verticalCenter
+
+                        StyledText {
+                            text: {
+                                var parts = []
+                                if (root.firstSession && root.firstSession !== "unknown")
+                                    parts.push(root.tr("Since") + " " + root.firstSession)
+                                parts.push(root.alltimeSessions + " " + root.tr("sessions"))
+                                parts.push(root.alltimeMessages.toLocaleString() + " " + root.tr("msgs"))
+                                return parts.join("  ·  ")
+                            }
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            wrapMode: Text.WordWrap
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
                     }
                 }
             }

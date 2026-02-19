@@ -2,115 +2,137 @@
 set -eu
 
 CLAUDE_DIR="${HOME}/.claude"
+CREDENTIALS="${CLAUDE_DIR}/.credentials.json"
 STATS_CACHE="${CLAUDE_DIR}/stats-cache.json"
 PROJECTS_DIR="${CLAUDE_DIR}/projects"
 
 TODAY=$(date +%Y-%m-%d)
-DOW=$(date +%u)
-DAYS_SINCE_MON=$((DOW - 1))
-WEEK_START=$(date -d "${DAYS_SINCE_MON} days ago" +%Y-%m-%d)
+SEVEN_DAYS_AGO=$(date -d "6 days ago" +%Y-%m-%d)
+MONTH_START=$(date +%Y-%m-01)
 
 # Defaults
-SESSION_MESSAGES=0
-SESSION_INPUT=0
-SESSION_OUTPUT=0
-SESSION_CACHE_READ=0
-SESSION_CACHE_WRITE=0
-SESSION_TOTAL=0
+SUBSCRIPTION_TYPE="unknown"
+RATE_LIMIT_TIER="unknown"
+FIVE_HOUR_UTIL=0
+FIVE_HOUR_RESET=""
+SEVEN_DAY_UTIL=0
+SEVEN_DAY_RESET=""
+EXTRA_USAGE_ENABLED="false"
+
+WEEK_TOKENS=0
 WEEK_MESSAGES=0
 WEEK_SESSIONS=0
-WEEK_TOOL_CALLS=0
-WEEK_TOKENS=0
+MONTH_TOKENS=0
 WEEK_MODELS=""
+DAILY="0,0,0,0,0,0,0"
+
 ALLTIME_SESSIONS=0
 ALLTIME_MESSAGES=0
 FIRST_SESSION="unknown"
-DAILY="0,0,0,0,0,0,0"
 
-# --- Current Session ---
-# Find the most recently modified session JSONL file
-LATEST_SESSION=""
+# --- Subscription & API Usage ---
+if [ -f "$CREDENTIALS" ]; then
+    SUBSCRIPTION_TYPE=$(jq -r '.claudeAiOauth.subscriptionType // "unknown"' "$CREDENTIALS")
+    RATE_LIMIT_TIER=$(jq -r '.claudeAiOauth.rateLimitTier // "unknown"' "$CREDENTIALS")
+
+    TOKEN=$(jq -r '.claudeAiOauth.accessToken // ""' "$CREDENTIALS")
+    if [ -n "$TOKEN" ]; then
+        API_RESPONSE=$(curl -s --max-time 5 \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '{}')
+
+        FIVE_HOUR_UTIL=$(echo "$API_RESPONSE" | jq -r '.five_hour.utilization // 0')
+        FIVE_HOUR_RESET=$(echo "$API_RESPONSE" | jq -r '.five_hour.resets_at // ""')
+        SEVEN_DAY_UTIL=$(echo "$API_RESPONSE" | jq -r '.seven_day.utilization // 0')
+        SEVEN_DAY_RESET=$(echo "$API_RESPONSE" | jq -r '.seven_day.resets_at // ""')
+        EXTRA_USAGE_ENABLED=$(echo "$API_RESPONSE" | jq -r '.extra_usage.is_enabled // false')
+    fi
+fi
+
+# --- Token consumption from JSONL session files ---
 if [ -d "$PROJECTS_DIR" ]; then
-    LATEST_SESSION=$(find "$PROJECTS_DIR" -name "*.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null \
-        | sort -rn | head -1 | cut -d' ' -f2-)
-fi
-
-if [ -n "$LATEST_SESSION" ] && [ -f "$LATEST_SESSION" ]; then
-    # Stream-parse: first jq reads line-by-line, second slurps small usage objects
-    USAGE=$(jq -c 'select(.type == "assistant" and .message.usage != null) | .message.usage' \
-        "$LATEST_SESSION" 2>/dev/null \
-        | jq -s '{
-            messages: length,
-            input: (map(.input_tokens // 0) | add // 0),
-            output: (map(.output_tokens // 0) | add // 0),
-            cache_read: (map(.cache_read_input_tokens // 0) | add // 0),
-            cache_write: (map(.cache_creation_input_tokens // 0) | add // 0)
-        }' 2>/dev/null || echo '{}')
-
-    SESSION_MESSAGES=$(echo "$USAGE" | jq -r '.messages // 0')
-    SESSION_INPUT=$(echo "$USAGE" | jq -r '.input // 0')
-    SESSION_OUTPUT=$(echo "$USAGE" | jq -r '.output // 0')
-    SESSION_CACHE_READ=$(echo "$USAGE" | jq -r '.cache_read // 0')
-    SESSION_CACHE_WRITE=$(echo "$USAGE" | jq -r '.cache_write // 0')
-    SESSION_TOTAL=$((SESSION_INPUT + SESSION_OUTPUT + SESSION_CACHE_READ + SESSION_CACHE_WRITE))
-fi
-
-# --- Weekly & All-time from stats cache ---
-if [ -f "$STATS_CACHE" ]; then
-    # Weekly activity aggregates
-    WEEK_DATA=$(jq --arg start "$WEEK_START" --arg today "$TODAY" '{
-        messages: ([.dailyActivity[]? | select(.date >= $start and .date <= $today) | .messageCount] | add // 0),
-        sessions: ([.dailyActivity[]? | select(.date >= $start and .date <= $today) | .sessionCount] | add // 0),
-        toolCalls: ([.dailyActivity[]? | select(.date >= $start and .date <= $today) | .toolCallCount] | add // 0),
-        tokens: ([.dailyModelTokens[]? | select(.date >= $start and .date <= $today) | .tokensByModel | to_entries | map(.value) | add // 0] | add // 0)
-    }' "$STATS_CACHE" 2>/dev/null || echo '{}')
-
-    WEEK_MESSAGES=$(echo "$WEEK_DATA" | jq -r '.messages // 0')
-    WEEK_SESSIONS=$(echo "$WEEK_DATA" | jq -r '.sessions // 0')
-    WEEK_TOOL_CALLS=$(echo "$WEEK_DATA" | jq -r '.toolCalls // 0')
-    WEEK_TOKENS=$(echo "$WEEK_DATA" | jq -r '.tokens // 0')
-
-    # Model breakdown for the week (raw output to avoid JSON quotes)
-    WEEK_MODELS=$(jq -r --arg start "$WEEK_START" --arg today "$TODAY" '
-        [.dailyModelTokens[]? | select(.date >= $start and .date <= $today) | .tokensByModel | to_entries[]] |
-        group_by(.key) | map("\(.[0].key):\(map(.value) | add)") | join(",")
-    ' "$STATS_CACHE" 2>/dev/null || echo "")
-
-    # Daily token breakdown (Monday=index0 .. Sunday=index6)
-    DAILY_PARTS=()
-    for i in $(seq 0 6); do
-        DAY_DATE=$(date -d "${WEEK_START} + ${i} days" +%Y-%m-%d)
-        if [[ "$DAY_DATE" > "$TODAY" ]]; then
-            DAILY_PARTS+=("0")
-        else
-            DAY_TOKENS=$(jq --arg d "$DAY_DATE" '
-                [.dailyModelTokens[]? | select(.date == $d) | .tokensByModel | to_entries | map(.value) | add // 0] | add // 0
-            ' "$STATS_CACHE" 2>/dev/null || echo 0)
-            DAILY_PARTS+=("${DAY_TOKENS}")
-        fi
+    # Pre-compute rolling 7-day dates (index 1=6 days ago ... index 7=today)
+    DAY_DATES=""
+    for i in 6 5 4 3 2 1 0; do
+        d=$(date -d "${i} days ago" +%Y-%m-%d)
+        DAY_DATES="${DAY_DATES:+${DAY_DATES},}${d}"
     done
-    DAILY=$(IFS=,; echo "${DAILY_PARTS[*]}")
 
-    # All-time stats
+    # Single pass: parse all session files and output final key=value pairs
+    while IFS='=' read -r key value; do
+        case "$key" in
+            WEEK_TOKENS) WEEK_TOKENS="$value" ;;
+            WEEK_MESSAGES) WEEK_MESSAGES="$value" ;;
+            WEEK_SESSIONS) WEEK_SESSIONS="$value" ;;
+            MONTH_TOKENS) MONTH_TOKENS="$value" ;;
+            DAILY) DAILY="$value" ;;
+            WEEK_MODELS) WEEK_MODELS="$value" ;;
+        esac
+    done < <(find "$PROJECTS_DIR" -name "*.jsonl" -mtime -31 -exec \
+        jq -r 'select(.type == "assistant") | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens + .message.usage.output_tokens + .message.usage.cache_read_input_tokens + .message.usage.cache_creation_input_tokens) \(.sessionId // "unknown")"' {} + 2>/dev/null \
+        | awk -v week_start="$SEVEN_DAYS_AGO" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" '
+        BEGIN { split(day_dates, dates, ",") }
+        {
+            day[$1] += $3
+            if ($1 >= week_start) {
+                week_model[$2] += $3
+                week_tokens += $3
+                week_msgs++
+                week_sess[$4] = 1
+            }
+            if ($1 >= month_start) month_tokens += $3
+        }
+        END {
+            printf "WEEK_TOKENS=%d\n", week_tokens + 0
+            printf "WEEK_MESSAGES=%d\n", week_msgs + 0
+            n = 0; for (s in week_sess) n++
+            printf "WEEK_SESSIONS=%d\n", n
+            printf "MONTH_TOKENS=%d\n", month_tokens + 0
+
+            daily = ""
+            for (i = 1; i <= 7; i++) {
+                val = (dates[i] in day) ? day[dates[i]] : 0
+                daily = daily (i > 1 ? "," : "") val + 0
+            }
+            printf "DAILY=%s\n", daily
+
+            models = ""
+            first = 1
+            for (m in week_model) {
+                if (week_model[m] > 0) {
+                    models = models (first ? "" : ",") m ":" week_model[m]
+                    first = 0
+                }
+            }
+            printf "WEEK_MODELS=%s\n", models
+        }')
+fi
+
+# --- All-time from stats cache (supplementary) ---
+if [ -f "$STATS_CACHE" ]; then
     ALLTIME_SESSIONS=$(jq -r '.totalSessions // 0' "$STATS_CACHE" 2>/dev/null || echo 0)
     ALLTIME_MESSAGES=$(jq -r '.totalMessages // 0' "$STATS_CACHE" 2>/dev/null || echo 0)
     FIRST_SESSION=$(jq -r '.firstSessionDate // "unknown"' "$STATS_CACHE" 2>/dev/null || echo "unknown")
-    FIRST_SESSION="${FIRST_SESSION%%T*}" # Strip time part
+    FIRST_SESSION="${FIRST_SESSION%%T*}"
 fi
 
 # Output key=value pairs
-echo "SESSION_MESSAGES=${SESSION_MESSAGES}"
-echo "SESSION_INPUT=${SESSION_INPUT}"
-echo "SESSION_OUTPUT=${SESSION_OUTPUT}"
-echo "SESSION_CACHE_READ=${SESSION_CACHE_READ}"
-echo "SESSION_CACHE_WRITE=${SESSION_CACHE_WRITE}"
-echo "SESSION_TOTAL=${SESSION_TOTAL}"
+echo "SUBSCRIPTION_TYPE=${SUBSCRIPTION_TYPE}"
+echo "RATE_LIMIT_TIER=${RATE_LIMIT_TIER}"
+echo "FIVE_HOUR_UTIL=${FIVE_HOUR_UTIL}"
+echo "FIVE_HOUR_RESET=${FIVE_HOUR_RESET}"
+echo "SEVEN_DAY_UTIL=${SEVEN_DAY_UTIL}"
+echo "SEVEN_DAY_RESET=${SEVEN_DAY_RESET}"
+echo "EXTRA_USAGE_ENABLED=${EXTRA_USAGE_ENABLED}"
 echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
 echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
-echo "WEEK_TOOL_CALLS=${WEEK_TOOL_CALLS}"
 echo "WEEK_TOKENS=${WEEK_TOKENS}"
 echo "WEEK_MODELS=${WEEK_MODELS}"
 echo "ALLTIME_SESSIONS=${ALLTIME_SESSIONS}"
 echo "ALLTIME_MESSAGES=${ALLTIME_MESSAGES}"
 echo "FIRST_SESSION=${FIRST_SESSION}"
 echo "DAILY=${DAILY}"
+echo "MONTH_TOKENS=${MONTH_TOKENS}"

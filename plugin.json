@@ -1,9 +1,9 @@
 {
     "id": "claudeCodeUsage",
     "name": "Claude Code Usage",
-    "description": "Monitor your Claude Code subscription usage with session and weekly token tracking",
+    "description": "Monitor your Claude Code subscription usage with token tracking, rate limits, and daily activity charts",
     "version": "1.0.0",
-    "author": "nicolas",
+    "author": "Nicolas Bellamy",
     "icon": "monitoring",
     "type": "widget",
     "capabilities": ["dankbar-widget"],
