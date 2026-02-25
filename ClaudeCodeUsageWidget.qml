@@ -60,7 +60,11 @@ PluginComponent {
     property real todayCost: 0
     property real weekCost: 0
     property real monthCost: 0
+    property var dailyCosts: [0, 0, 0, 0, 0, 0, 0]
     property real usdEurRate: 0
+
+    // Chart hover state
+    property int hoveredDay: -1
 
     // Model list
     ListModel { id: modelListData }
@@ -195,6 +199,13 @@ PluginComponent {
         case "WEEK_COST": weekCost = parseFloat(val) || 0; break
         case "MONTH_COST": monthCost = parseFloat(val) || 0; break
         case "USD_EUR_RATE": usdEurRate = parseFloat(val) || 0; break
+        case "DAILY_COSTS":
+            var cparts = val.split(",")
+            var carr = []
+            for (var k = 0; k < 7; k++)
+                carr.push(k < cparts.length ? (parseFloat(cparts[k]) || 0) : 0)
+            dailyCosts = carr
+            break
         }
     }
 
@@ -643,7 +654,22 @@ PluginComponent {
                                                     ? Math.max(root.dailyTokens[index] / root.maxDaily * parent.height, root.dailyTokens[index] > 0 ? 3 : 0)
                                                     : 0
                                                 radius: 2
-                                                color: index === root.todayIndex ? Theme.primary : Theme.surfaceVariant
+                                                color: index === root.hoveredDay
+                                                    ? Theme.primary
+                                                    : index === root.todayIndex ? Theme.primary : Theme.surfaceVariant
+                                                opacity: root.hoveredDay >= 0 && index !== root.hoveredDay ? 0.4 : 1.0
+
+                                                Behavior on opacity {
+                                                    NumberAnimation { duration: 120 }
+                                                }
+                                            }
+
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                enabled: root.dailyTokens[index] > 0
+                                                onEntered: root.hoveredDay = index
+                                                onExited: root.hoveredDay = -1
                                             }
                                         }
 
@@ -651,11 +677,59 @@ PluginComponent {
                                             id: dayLabel
                                             text: root.dayLabels[index]
                                             font.pixelSize: 11
-                                            color: index === root.todayIndex ? Theme.primary : Theme.surfaceVariantText
+                                            color: index === root.hoveredDay
+                                                ? Theme.primary
+                                                : index === root.todayIndex ? Theme.primary : Theme.surfaceVariantText
                                             anchors.horizontalCenter: parent.horizontalCenter
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // Tooltip on hover — child of StyledRect to avoid clip issues
+                    Rectangle {
+                        id: chartTooltip
+                        visible: root.hoveredDay >= 0 && root.dailyTokens[root.hoveredDay] > 0
+                        z: 10
+
+                        x: {
+                            var colW = (chartRow.width - 6 * 4) / 7
+                            var cx = root.hoveredDay * (colW + 4) + colW / 2 - width / 2
+                            var chartX = chartRow.mapToItem(chartTooltip.parent, 0, 0).x
+                            var raw = chartX + cx
+                            return Math.max(Theme.spacingM, Math.min(raw, parent.width - width - Theme.spacingM))
+                        }
+                        y: {
+                            var chartY = chartRow.mapToItem(chartTooltip.parent, 0, 0).y
+                            return chartY - height - 2
+                        }
+
+                        width: tooltipCol.width + Theme.spacingS * 2
+                        height: tooltipCol.height + Theme.spacingXS * 2
+                        radius: 4
+                        color: Theme.surfaceContainer
+
+                        Column {
+                            id: tooltipCol
+                            anchors.centerIn: parent
+                            spacing: 1
+
+                            StyledText {
+                                text: root.hoveredDay >= 0 ? root.formatTokens(root.dailyTokens[root.hoveredDay]) : ""
+                                font.pixelSize: 11
+                                font.weight: Font.DemiBold
+                                color: Theme.surfaceText
+                                anchors.horizontalCenter: parent.horizontalCenter
+                            }
+
+                            StyledText {
+                                visible: root.hoveredDay >= 0 && root.dailyCosts[root.hoveredDay] > 0
+                                text: root.hoveredDay >= 0 ? root.formatCost(root.dailyCosts[root.hoveredDay]) : ""
+                                font.pixelSize: 11
+                                color: Theme.surfaceVariantText
+                                anchors.horizontalCenter: parent.horizontalCenter
                             }
                         }
                     }
