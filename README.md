@@ -10,10 +10,13 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
 - **Detailed popout** with:
   - 5-hour and 7-day rate window utilization with countdown timers
   - Token consumption breakdown (today, week, month)
-  - 7-day daily activity bar chart
-  - Per-model token usage for the current week
+  - Estimated API cost per period (today, week, month) with automatic pricing from [LiteLLM](https://github.com/BerriAI/litellm)
+  - 7-day daily activity bar chart with interactive hover tooltips (token count + cost)
+  - Per-model token usage for the current week with dynamic model family detection
   - All-time session and message statistics
 - **Automatic subscription detection** via the Anthropic OAuth API
+- **Dynamic model pricing** — new Anthropic model families are detected automatically, no code changes needed
+- **Currency support** — costs displayed in EUR for French locale, USD otherwise (exchange rate from ECB via [Frankfurter](https://www.frankfurter.app/))
 - **Configurable refresh interval** (30s to 5min)
 - **Localization support** (English and French)
 
@@ -55,8 +58,9 @@ The plugin runs a lightweight bash script at the configured interval that:
 1. Reads your OAuth token from `~/.claude/.credentials.json`
 2. Queries the Anthropic usage API for current rate limit status
 3. Parses local JSONL session files for token consumption statistics
+4. Fetches model pricing from LiteLLM and USD/EUR exchange rate from ECB (cached daily in `~/.claude/pricing-cache.json`)
 
-All data stays local. The only network request is to the official Anthropic API using your existing OAuth credentials.
+All data stays local. Network requests are limited to the official Anthropic API (usage), GitHub (LiteLLM pricing, once/day), and Frankfurter (exchange rate, once/day).
 
 ## License
 
