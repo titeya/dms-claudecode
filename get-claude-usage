@@ -71,8 +71,8 @@ if [ -d "$PROJECTS_DIR" ]; then
             DAILY) DAILY="$value" ;;
             WEEK_MODELS) WEEK_MODELS="$value" ;;
         esac
-    done < <(find "$PROJECTS_DIR" -name "*.jsonl" -mtime -31 -exec \
-        jq -r 'select(.type == "assistant") | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens + .message.usage.output_tokens + .message.usage.cache_read_input_tokens + .message.usage.cache_creation_input_tokens) \(.sessionId // "unknown")"' {} + 2>/dev/null \
+    done < <(find "$PROJECTS_DIR" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
+        | jq -r -R 'fromjson? | select(.type == "assistant") | "\(.timestamp[:10]) \(.message.model // "unknown") \((.message.usage.input_tokens // 0) + (.message.usage.output_tokens // 0) + (.message.usage.cache_read_input_tokens // 0) + (.message.usage.cache_creation_input_tokens // 0)) \(.sessionId // "unknown")"' \
         | awk -v week_start="$SEVEN_DAYS_AGO" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" '
         BEGIN { split(day_dates, dates, ",") }
         {

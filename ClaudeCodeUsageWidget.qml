@@ -692,6 +692,7 @@ PluginComponent {
                     width: parent.width
                     height: allTimeRow.implicitHeight + Theme.spacingM * 2
                     color: Theme.surfaceContainerHigh
+                    visible: root.alltimeSessions > 0 || root.alltimeMessages > 0
 
                     Row {
                         id: allTimeRow
@@ -722,6 +723,9 @@ PluginComponent {
                         }
                     }
                 }
+
+                // Bottom padding to match sides (compensates Column spacing)
+                Item { width: 1; height: 1 }
             }
         }
     }
