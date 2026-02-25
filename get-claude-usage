@@ -5,6 +5,8 @@ CLAUDE_DIR="${HOME}/.claude"
 CREDENTIALS="${CLAUDE_DIR}/.credentials.json"
 STATS_CACHE="${CLAUDE_DIR}/stats-cache.json"
 PROJECTS_DIR="${CLAUDE_DIR}/projects"
+PRICING_CACHE="${CLAUDE_DIR}/pricing-cache.json"
+LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 TODAY=$(date +%Y-%m-%d)
 SEVEN_DAYS_AGO=$(date -d "6 days ago" +%Y-%m-%d)
@@ -26,9 +28,80 @@ MONTH_TOKENS=0
 WEEK_MODELS=""
 DAILY="0,0,0,0,0,0,0"
 
+TODAY_COST="0.00"
+WEEK_COST="0.00"
+MONTH_COST="0.00"
+DAILY_COSTS="0,0,0,0,0,0,0"
+
 ALLTIME_SESSIONS=0
 ALLTIME_MESSAGES=0
 FIRST_SESSION="unknown"
+
+# --- Pricing cache (refresh once per day from LiteLLM) ---
+PRICING_JSON=""
+refresh_pricing() {
+    local raw
+    raw=$(curl -s --max-time 10 "$LITELLM_URL" 2>/dev/null) || return 1
+    # Extract canonical Anthropic direct API prices for each family
+    local result
+    result=$(echo "$raw" | jq -c '{
+        updated: "'"$TODAY"'",
+        models: {
+            opus: (to_entries | map(select(.key == "claude-opus-4-6")) | first // null | .value | {
+                input: .input_cost_per_token,
+                output: .output_cost_per_token,
+                cache_read: .cache_read_input_token_cost,
+                cache_write: .cache_creation_input_token_cost
+            }),
+            sonnet: (to_entries | map(select(.key == "claude-sonnet-4-6")) | first // null | .value | {
+                input: .input_cost_per_token,
+                output: .output_cost_per_token,
+                cache_read: .cache_read_input_token_cost,
+                cache_write: .cache_creation_input_token_cost
+            }),
+            haiku: (to_entries | map(select(.key == "claude-haiku-4-5")) | first // null | .value | {
+                input: .input_cost_per_token,
+                output: .output_cost_per_token,
+                cache_read: .cache_read_input_token_cost,
+                cache_write: .cache_creation_input_token_cost
+            })
+        }
+    }' 2>/dev/null) || return 1
+    # Fetch USD→EUR exchange rate from ECB via Frankfurter
+    local eur_rate
+    eur_rate=$(curl -s --max-time 5 "https://api.frankfurter.app/latest?from=USD&to=EUR" 2>/dev/null \
+        | jq -r '.rates.EUR // empty' 2>/dev/null) || eur_rate=""
+    if [ -n "$eur_rate" ]; then
+        result=$(echo "$result" | jq -c '. + {usd_eur_rate: '"$eur_rate"'}' 2>/dev/null)
+    fi
+
+    # Validate that we got actual prices
+    local check
+    check=$(echo "$result" | jq -r '.models.opus.input // empty' 2>/dev/null) || return 1
+    [ -n "$check" ] && echo "$result" > "$PRICING_CACHE" && return 0
+    return 1
+}
+
+if [ -f "$PRICING_CACHE" ]; then
+    cached_date=$(jq -r '.updated // ""' "$PRICING_CACHE" 2>/dev/null || echo "")
+    if [ "$cached_date" != "$TODAY" ]; then
+        refresh_pricing || true
+    fi
+    PRICING_JSON=$(cat "$PRICING_CACHE")
+else
+    refresh_pricing || true
+    [ -f "$PRICING_CACHE" ] && PRICING_JSON=$(cat "$PRICING_CACHE")
+fi
+
+# Build awk-friendly pricing string: "opus:input:output:cache_read:cache_write,sonnet:...,haiku:..."
+PRICING_AWK=""
+USD_EUR_RATE="0"
+if [ -n "$PRICING_JSON" ]; then
+    PRICING_AWK=$(echo "$PRICING_JSON" | jq -r '
+        [.models | to_entries[] | "\(.key):\(.value.input):\(.value.output):\(.value.cache_read):\(.value.cache_write)"]
+        | join(",")' 2>/dev/null || echo "")
+    USD_EUR_RATE=$(echo "$PRICING_JSON" | jq -r '.usd_eur_rate // 0' 2>/dev/null || echo "0")
+fi
 
 # --- Subscription & API Usage ---
 if [ -f "$CREDENTIALS" ]; then
@@ -61,7 +134,7 @@ if [ -d "$PROJECTS_DIR" ]; then
         DAY_DATES="${DAY_DATES:+${DAY_DATES},}${d}"
     done
 
-    # Single pass: parse all session files and output final key=value pairs
+    # Single pass: extract granular tokens per message, aggregate with awk
     while IFS='=' read -r key value; do
         case "$key" in
             WEEK_TOKENS) WEEK_TOKENS="$value" ;;
@@ -70,24 +143,59 @@ if [ -d "$PROJECTS_DIR" ]; then
             MONTH_TOKENS) MONTH_TOKENS="$value" ;;
             DAILY) DAILY="$value" ;;
             WEEK_MODELS) WEEK_MODELS="$value" ;;
+            TODAY_COST) TODAY_COST="$value" ;;
+            WEEK_COST) WEEK_COST="$value" ;;
+            MONTH_COST) MONTH_COST="$value" ;;
+            DAILY_COSTS) DAILY_COSTS="$value" ;;
         esac
     done < <(find "$PROJECTS_DIR" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
-        | jq -r -R 'fromjson? | select(.type == "assistant") | "\(.timestamp[:10]) \(.message.model // "unknown") \((.message.usage.input_tokens // 0) + (.message.usage.output_tokens // 0) + (.message.usage.cache_read_input_tokens // 0) + (.message.usage.cache_creation_input_tokens // 0)) \(.sessionId // "unknown")"' \
-        | awk -v week_start="$SEVEN_DAYS_AGO" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" '
-        BEGIN { split(day_dates, dates, ",") }
-        {
-            day[$1] += $3
-            if ($1 >= week_start) {
-                family = $2
-                if (index(family, "opus") > 0) family = "opus"
-                else if (index(family, "sonnet") > 0) family = "sonnet"
-                else if (index(family, "haiku") > 0) family = "haiku"
-                week_model[family] += $3
-                week_tokens += $3
-                week_msgs++
-                week_sess[$4] = 1
+        | jq -r -R 'fromjson? | select(.type == "assistant") | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
+        | awk -v week_start="$SEVEN_DAYS_AGO" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
+        BEGIN {
+            split(day_dates, dates, ",")
+            # Parse pricing: "opus:in:out:cr:cw,sonnet:in:out:cr:cw,haiku:in:out:cr:cw"
+            has_pricing = 0
+            if (pricing != "") {
+                n = split(pricing, pmodels, ",")
+                for (i = 1; i <= n; i++) {
+                    split(pmodels[i], pp, ":")
+                    price_in[pp[1]] = pp[2] + 0
+                    price_out[pp[1]] = pp[3] + 0
+                    price_cr[pp[1]] = pp[4] + 0
+                    price_cw[pp[1]] = pp[5] + 0
+                }
+                has_pricing = 1
             }
-            if ($1 >= month_start) month_tokens += $3
+        }
+        {
+            date = $1; model = $2
+            inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
+            sess = $7
+            total = inp + out + cr + cw
+
+            # Determine model family
+            family = model
+            if (index(family, "opus") > 0) family = "opus"
+            else if (index(family, "sonnet") > 0) family = "sonnet"
+            else if (index(family, "haiku") > 0) family = "haiku"
+
+            # Token aggregation (same as before)
+            day[date] += total
+            if (date >= week_start) {
+                week_model[family] += total
+                week_tokens += total
+                week_msgs++
+                week_sess[sess] = 1
+            }
+            if (date >= month_start) month_tokens += total
+
+            # Cost calculation
+            if (has_pricing && (family in price_in)) {
+                cost = inp * price_in[family] + out * price_out[family] + cr * price_cr[family] + cw * price_cw[family]
+                day_cost[date] += cost
+                if (date >= week_start) week_cost += cost
+                if (date >= month_start) month_cost += cost
+            }
         }
         END {
             printf "WEEK_TOKENS=%d\n", week_tokens + 0
@@ -112,6 +220,17 @@ if [ -d "$PROJECTS_DIR" ]; then
                 }
             }
             printf "WEEK_MODELS=%s\n", models
+
+            # Cost outputs
+            daily_costs = ""
+            for (i = 1; i <= 7; i++) {
+                val = (dates[i] in day_cost) ? day_cost[dates[i]] : 0
+                daily_costs = daily_costs (i > 1 ? "," : "") sprintf("%.2f", val)
+            }
+            printf "DAILY_COSTS=%s\n", daily_costs
+            printf "TODAY_COST=%.2f\n", (dates[7] in day_cost) ? day_cost[dates[7]] : 0
+            printf "WEEK_COST=%.2f\n", week_cost + 0
+            printf "MONTH_COST=%.2f\n", month_cost + 0
         }')
 fi
 
@@ -140,3 +259,8 @@ echo "ALLTIME_MESSAGES=${ALLTIME_MESSAGES}"
 echo "FIRST_SESSION=${FIRST_SESSION}"
 echo "DAILY=${DAILY}"
 echo "MONTH_TOKENS=${MONTH_TOKENS}"
+echo "TODAY_COST=${TODAY_COST}"
+echo "WEEK_COST=${WEEK_COST}"
+echo "MONTH_COST=${MONTH_COST}"
+echo "DAILY_COSTS=${DAILY_COSTS}"
+echo "USD_EUR_RATE=${USD_EUR_RATE}"
