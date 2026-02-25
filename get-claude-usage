@@ -42,30 +42,29 @@ PRICING_JSON=""
 refresh_pricing() {
     local raw
     raw=$(curl -s --max-time 10 "$LITELLM_URL" 2>/dev/null) || return 1
-    # Extract canonical Anthropic direct API prices for each family
+    # Dynamically extract pricing for all Claude model families
+    # Pattern: "claude-{family}-{major}-{minor}" (no date suffix, no provider prefix)
+    # Groups by family name, takes the latest version per family
     local result
     result=$(echo "$raw" | jq -c '{
         updated: "'"$TODAY"'",
-        models: {
-            opus: (to_entries | map(select(.key == "claude-opus-4-6")) | first // null | .value | {
-                input: .input_cost_per_token,
-                output: .output_cost_per_token,
-                cache_read: .cache_read_input_token_cost,
-                cache_write: .cache_creation_input_token_cost
-            }),
-            sonnet: (to_entries | map(select(.key == "claude-sonnet-4-6")) | first // null | .value | {
-                input: .input_cost_per_token,
-                output: .output_cost_per_token,
-                cache_read: .cache_read_input_token_cost,
-                cache_write: .cache_creation_input_token_cost
-            }),
-            haiku: (to_entries | map(select(.key == "claude-haiku-4-5")) | first // null | .value | {
-                input: .input_cost_per_token,
-                output: .output_cost_per_token,
-                cache_read: .cache_read_input_token_cost,
-                cache_write: .cache_creation_input_token_cost
-            })
-        }
+        models: ([to_entries[]
+            | select(.key | test("^claude-[a-z]+-[0-9]+-[0-9]+$"))
+            | select(.value.input_cost_per_token > 0)
+            | {
+                family: (.key | split("-") | .[1]),
+                key: .key,
+                value: .value
+              }
+        ] | group_by(.family)
+          | map(sort_by(.key) | last
+              | {key: .family, value: {
+                    input: .value.input_cost_per_token,
+                    output: .value.output_cost_per_token,
+                    cache_read: .value.cache_read_input_token_cost,
+                    cache_write: .value.cache_creation_input_token_cost
+                }})
+          | from_entries)
     }' 2>/dev/null) || return 1
     # Fetch USD→EUR exchange rate from ECB via Frankfurter
     local eur_rate
@@ -173,11 +172,9 @@ if [ -d "$PROJECTS_DIR" ]; then
             sess = $7
             total = inp + out + cr + cw
 
-            # Determine model family
-            family = model
-            if (index(family, "opus") > 0) family = "opus"
-            else if (index(family, "sonnet") > 0) family = "sonnet"
-            else if (index(family, "haiku") > 0) family = "haiku"
+            # Extract family from model name (claude-{family}-{version...})
+            n_parts = split(model, mparts, "-")
+            family = (n_parts >= 3 && mparts[1] == "claude") ? mparts[2] : model
 
             # Token aggregation (same as before)
             day[date] += total
