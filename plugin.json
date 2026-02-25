@@ -2,7 +2,7 @@
     "id": "claudeCodeUsage",
     "name": "Claude Code Usage",
     "description": "Monitor your Claude Code subscription usage with token tracking, rate limits, and daily activity charts",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "Nicolas Bellamy",
     "icon": "monitoring",
     "type": "widget",
