@@ -125,10 +125,8 @@ PluginComponent {
     }
 
     function shortModelName(name) {
-        if (name.indexOf("opus") >= 0) return "Opus"
-        if (name.indexOf("sonnet") >= 0) return "Sonnet"
-        if (name.indexOf("haiku") >= 0) return "Haiku"
-        return name
+        if (!name || name.length === 0) return name
+        return name.charAt(0).toUpperCase() + name.slice(1)
     }
 
     function progressColor(pct) {
