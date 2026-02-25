@@ -56,6 +56,12 @@ PluginComponent {
     // Daily breakdown (rolling 7 days, computed from JSONL files)
     property var dailyTokens: [0, 0, 0, 0, 0, 0, 0]
 
+    // Estimated API cost (in USD)
+    property real todayCost: 0
+    property real weekCost: 0
+    property real monthCost: 0
+    property real usdEurRate: 0
+
     // Model list
     ListModel { id: modelListData }
 
@@ -127,6 +133,17 @@ PluginComponent {
         return Theme.primary
     }
 
+    function formatCost(usd) {
+        var useEur = lang === "fr" && usdEurRate > 0
+        var n = useEur ? usd * usdEurRate : usd
+        var sym = useEur ? "" : "$"
+        var suffix = useEur ? " €" : ""
+        if (n >= 1000) return sym + (n / 1000).toFixed(1) + "K" + suffix
+        if (n >= 100) return sym + Math.round(n) + suffix
+        if (n >= 10) return sym + n.toFixed(1) + suffix
+        return sym + n.toFixed(2) + suffix
+    }
+
     function formatTier(tier) {
         if (tier.indexOf("max_20x") >= 0) return "Max 20x"
         if (tier.indexOf("max_5x") >= 0) return "Max 5x"
@@ -174,6 +191,10 @@ PluginComponent {
                 arr.push(j < parts.length ? (parseFloat(parts[j]) || 0) : 0)
             dailyTokens = arr
             break
+        case "TODAY_COST": todayCost = parseFloat(val) || 0; break
+        case "WEEK_COST": weekCost = parseFloat(val) || 0; break
+        case "MONTH_COST": monthCost = parseFloat(val) || 0; break
+        case "USD_EUR_RATE": usdEurRate = parseFloat(val) || 0; break
         }
     }
 
@@ -511,6 +532,13 @@ PluginComponent {
                                     color: Theme.primary
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
+                                StyledText {
+                                    text: root.formatCost(root.todayCost)
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    visible: root.todayCost > 0
+                                }
                             }
 
                             Column {
@@ -530,6 +558,13 @@ PluginComponent {
                                     color: Theme.surfaceText
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
+                                StyledText {
+                                    text: root.formatCost(root.weekCost)
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    visible: root.weekCost > 0
+                                }
                             }
 
                             Column {
@@ -548,6 +583,13 @@ PluginComponent {
                                     font.weight: Font.DemiBold
                                     color: Theme.surfaceText
                                     anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatCost(root.monthCost)
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    visible: root.monthCost > 0
                                 }
                             }
                         }
