@@ -25,3 +25,35 @@ jobs:
         run: |
           chmod +x tests/*.sh
           for t in tests/test-*.sh; do bash "$t"; done
+
+  version-bump:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: [shellcheck, tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Bump patch version and tag
+        run: |
+          current=$(jq -r '.version' plugin.json)
+          IFS='.' read -r major minor patch <<< "$current"
+          new_version="${major}.${minor}.$((patch + 1))"
+
+          # Check if this version was already tagged (idempotency)
+          if git tag -l "v${new_version}" | grep -q .; then
+            echo "Tag v${new_version} already exists, skipping."
+            exit 0
+          fi
+
+          jq --arg v "$new_version" '.version = $v' plugin.json > plugin.json.tmp
+          mv plugin.json.tmp plugin.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add plugin.json
+          git commit -m "Bump version to ${new_version}"
+          git tag "v${new_version}"
+          git push origin master --tags
