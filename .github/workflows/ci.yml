@@ -27,7 +27,7 @@ jobs:
           for t in tests/test-*.sh; do bash "$t"; done
 
   version-bump:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !startsWith(github.event.head_commit.message, 'Bump version to ')
     needs: [shellcheck, tests]
     runs-on: ubuntu-latest
     permissions:
