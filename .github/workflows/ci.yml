@@ -32,19 +32,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Bump patch version and tag
+      - name: Bump patch version and create PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           current=$(jq -r '.version' plugin.json)
           IFS='.' read -r major minor patch <<< "$current"
           new_version="${major}.${minor}.$((patch + 1))"
+          branch="chore/bump-v${new_version}"
 
-          # Check if this version was already tagged (idempotency)
-          if git tag -l "v${new_version}" | grep -q .; then
-            echo "Tag v${new_version} already exists, skipping."
+          # Skip if a bump PR already exists for this version
+          if gh pr list --head "$branch" --json number --jq 'length' | grep -qv '^0$'; then
+            echo "PR for $branch already exists, skipping."
             exit 0
           fi
 
@@ -53,7 +55,12 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
           git add plugin.json
           git commit -m "Bump version to ${new_version}"
-          git tag "v${new_version}"
-          git push origin master --tags
+          git push -u origin "$branch"
+
+          gh pr create \
+            --title "Bump version to ${new_version}" \
+            --body "Automated patch version bump: \`${current}\` → \`${new_version}\`" \
+            --label "automated"
