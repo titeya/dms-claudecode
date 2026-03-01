@@ -26,9 +26,27 @@ jobs:
           chmod +x tests/*.sh
           for t in tests/test-*.sh; do bash "$t"; done
 
-  version-bump:
+  check-source-changes:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !startsWith(github.event.head_commit.message, 'Bump version to ')
-    needs: [shellcheck, tests]
+    runs-on: ubuntu-latest
+    outputs:
+      has_source_changes: ${{ steps.changes.outputs.has_source_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Check for source file changes
+        id: changes
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -qE '^(get-claude-usage|.*\.qml|translations\.js|plugin\.json)$'; then
+            echo "has_source_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_source_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  version-bump:
+    needs: [shellcheck, tests, check-source-changes]
+    if: needs.check-source-changes.outputs.has_source_changes == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
