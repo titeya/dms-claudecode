@@ -185,11 +185,13 @@ cat > "$ENV6/.claude/pricing-cache.json" << 'EUREOF'
 EUREOF
 
 OUTPUT6=$(run_script "$ENV6")
-EUR_RATE=$(echo "$OUTPUT6" | grep "^USD_EUR_RATE=" | cut -d= -f2)
 # The script reads usd_eur_rate from JSON as-is via jq; the QML side validates.
-# But USD_EUR_RATE should still be set (the script doesn't re-validate cached values)
-# What matters is that it doesn't crash.
-pass "Script runs with non-numeric EUR rate without crashing"
+# What matters is that it doesn't crash and still produces output.
+if echo "$OUTPUT6" | grep -q "^USD_EUR_RATE="; then
+    pass "Script runs with non-numeric EUR rate without crashing"
+else
+    fail "Script crashed or missing USD_EUR_RATE with non-numeric EUR rate"
+fi
 
 # ============================================================
 echo "=== Test 7: Pricing validation — cache without opus family ==="
