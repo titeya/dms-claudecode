@@ -24,7 +24,7 @@ PluginComponent {
         var labels = []
         var now = new Date()
         for (var i = 6; i >= 0; i--) {
-            var d = new Date(now.getTime() - i * 86400000)
+            var d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i)
             labels.push(days[d.getDay()])
         }
         return labels
@@ -221,8 +221,10 @@ PluginComponent {
         }
 
         onExited: (exitCode, exitStatus) => {
-            root.isLoading = false
-            root.refreshEpoch++
+            if (exitCode === 0) {
+                root.isLoading = false
+                root.refreshEpoch++
+            }
         }
     }
 
