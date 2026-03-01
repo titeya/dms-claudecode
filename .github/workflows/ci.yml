@@ -62,5 +62,4 @@ jobs:
 
           gh pr create \
             --title "Bump version to ${new_version}" \
-            --body "Automated patch version bump: \`${current}\` → \`${new_version}\`" \
-            --label "automated"
+            --body "Automated patch version bump: \`${current}\` → \`${new_version}\`"
