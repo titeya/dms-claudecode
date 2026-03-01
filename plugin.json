@@ -1,17 +1,22 @@
 {
-    "id": "claudeCodeUsage",
-    "name": "Claude Code Usage",
-    "description": "Monitor your Claude Code subscription usage with token tracking, estimated API costs, rate limits, and daily activity charts",
-    "version": "1.1.1",
-    "author": "Nicolas Bellamy",
-    "icon": "monitoring",
-    "type": "widget",
-    "capabilities": ["dankbar-widget"],
-    "component": "./ClaudeCodeUsageWidget.qml",
-    "settings": "./ClaudeCodeUsageSettings.qml",
-    "requires": ["jq", "curl"],
-    "permissions": [
-        "settings_read",
-        "settings_write"
-    ]
+  "id": "claudeCodeUsage",
+  "name": "Claude Code Usage",
+  "description": "Monitor your Claude Code subscription usage with token tracking, estimated API costs, rate limits, and daily activity charts",
+  "version": "1.1.2",
+  "author": "Nicolas Bellamy",
+  "icon": "monitoring",
+  "type": "widget",
+  "capabilities": [
+    "dankbar-widget"
+  ],
+  "component": "./ClaudeCodeUsageWidget.qml",
+  "settings": "./ClaudeCodeUsageSettings.qml",
+  "requires": [
+    "jq",
+    "curl"
+  ],
+  "permissions": [
+    "settings_read",
+    "settings_write"
+  ]
 }
