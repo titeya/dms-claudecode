@@ -15,7 +15,9 @@ PluginComponent {
     function tr(key) { return Tr.tr(key, lang) }
 
     // Rolling 7-day labels (index 0 = 6 days ago, index 6 = today)
+    property int refreshEpoch: 0
     property var dayLabels: {
+        void(refreshEpoch)
         var frDays = ["Di", "Lu", "Ma", "Me", "Je", "Ve", "Sa"]
         var enDays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
         var days = lang === "fr" ? frDays : enDays
@@ -220,6 +222,7 @@ PluginComponent {
 
         onExited: (exitCode, exitStatus) => {
             root.isLoading = false
+            root.refreshEpoch++
         }
     }
 
