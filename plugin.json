@@ -9,7 +9,7 @@
     "capabilities": ["dankbar-widget"],
     "component": "./ClaudeCodeUsageWidget.qml",
     "settings": "./ClaudeCodeUsageSettings.qml",
-    "requires": ["jq"],
+    "requires": ["jq", "curl"],
     "permissions": [
         "settings_read",
         "settings_write"

@@ -70,14 +70,14 @@ refresh_pricing() {
     local eur_rate
     eur_rate=$(curl -s --max-time 5 "https://api.frankfurter.app/latest?from=USD&to=EUR" 2>/dev/null \
         | jq -r '.rates.EUR // empty' 2>/dev/null) || eur_rate=""
-    if [ -n "$eur_rate" ]; then
+    if [ -n "$eur_rate" ] && [[ "$eur_rate" =~ ^[0-9]+\.?[0-9]*$ ]]; then
         result=$(echo "$result" | jq -c '. + {usd_eur_rate: '"$eur_rate"'}' 2>/dev/null)
     fi
 
-    # Validate that we got actual prices
+    # Validate that we got at least one model with pricing
     local check
-    check=$(echo "$result" | jq -r '.models.opus.input // empty' 2>/dev/null) || return 1
-    [ -n "$check" ] && echo "$result" > "$PRICING_CACHE" && return 0
+    check=$(echo "$result" | jq -r '.models | to_entries | length' 2>/dev/null) || return 1
+    [ "$check" -gt 0 ] 2>/dev/null && echo "$result" > "$PRICING_CACHE" && return 0
     return 1
 }
 
