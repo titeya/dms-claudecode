@@ -69,13 +69,24 @@ echo "=== Test 2: Token aggregation ==="
 # ============================================================
 ENV2=$(setup_env "test2")
 TODAY=$(date +%Y-%m-%d)
-YESTERDAY=$(date -d "1 day ago" +%Y-%m-%d)
+DOW=$(date +%u)  # 1=Monday, 7=Sunday
 
-# Create JSONL fixtures: 2 messages today (session A), 1 message yesterday (session B)
+# Pick a "second day" that's in the same calendar week as today
+# If today is Monday (DOW=1), there's no earlier day this week, so use tomorrow (Tuesday)
+if [ "$DOW" -eq 1 ]; then
+    OTHER_DAY=$(date -d "1 day" +%Y-%m-%d)
+    OTHER_IDX=1  # Tuesday = index 1
+else
+    OTHER_DAY=$(date -d "1 day ago" +%Y-%m-%d)
+    OTHER_IDX=$((DOW - 2))  # Yesterday's index
+fi
+TODAY_IDX=$((DOW - 1))
+
+# Create JSONL fixtures: 2 messages today (session A), 1 message on other day (session B)
 {
     make_jsonl_line "$TODAY" "claude-opus-4-20250514" 100 200 50 30 "sess-a"
     make_jsonl_line "$TODAY" "claude-opus-4-20250514" 150 100 0 0 "sess-a"
-    make_jsonl_line "$YESTERDAY" "claude-sonnet-4-20250514" 80 60 20 10 "sess-b"
+    make_jsonl_line "$OTHER_DAY" "claude-sonnet-4-20250514" 80 60 20 10 "sess-b"
 } > "$ENV2/.claude/projects/test-project/test.jsonl"
 
 OUTPUT2=$(run_script "$ENV2")
@@ -97,12 +108,12 @@ WEEK_MODELS=$(echo "$OUTPUT2" | grep "^WEEK_MODELS=" | cut -d= -f2)
 assert_match "$WEEK_MODELS" "opus" "WEEK_MODELS contains opus"
 assert_match "$WEEK_MODELS" "sonnet" "WEEK_MODELS contains sonnet"
 
-# DAILY: last value (today) should be 630 (380+250), second-to-last should be 170
+# DAILY: calendar week (Mon=index 0 ... Sun=index 6)
 DAILY=$(echo "$OUTPUT2" | grep "^DAILY=" | cut -d= -f2)
-DAILY_TODAY=$(echo "$DAILY" | tr ',' '\n' | tail -1)
-DAILY_YESTERDAY=$(echo "$DAILY" | tr ',' '\n' | tail -2 | head -1)
+DAILY_TODAY=$(echo "$DAILY" | tr ',' '\n' | sed -n "$((TODAY_IDX + 1))p")
+DAILY_OTHER=$(echo "$DAILY" | tr ',' '\n' | sed -n "$((OTHER_IDX + 1))p")
 assert_eq "$DAILY_TODAY" "630" "DAILY today=630"
-assert_eq "$DAILY_YESTERDAY" "170" "DAILY yesterday=170"
+assert_eq "$DAILY_OTHER" "170" "DAILY other day=170"
 
 # ============================================================
 echo "=== Test 3: Cost calculation ==="
