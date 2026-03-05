@@ -6,10 +6,16 @@ CREDENTIALS="${CLAUDE_DIR}/.credentials.json"
 STATS_CACHE="${CLAUDE_DIR}/stats-cache.json"
 PROJECTS_DIR="${CLAUDE_DIR}/projects"
 PRICING_CACHE="${CLAUDE_DIR}/pricing-cache.json"
+USAGE_CACHE="${CLAUDE_DIR}/usage-cache.json"
+USAGE_CACHE_TTL=120  # seconds
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
+CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
 TODAY=$(date +%Y-%m-%d)
-SEVEN_DAYS_AGO=$(date -d "6 days ago" +%Y-%m-%d)
+# Calendar week: Monday to Sunday
+DOW=$(date +%u)  # 1=Monday, 7=Sunday
+WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
+# Calendar month: 1st of current month
 MONTH_START=$(date +%Y-%m-01)
 
 # Defaults
@@ -102,34 +108,58 @@ if [ -n "$PRICING_JSON" ]; then
     USD_EUR_RATE=$(echo "$PRICING_JSON" | jq -r '.usd_eur_rate // 0' 2>/dev/null || echo "0")
 fi
 
-# --- Subscription & API Usage ---
+# --- Subscription & API Usage (with cache to avoid rate limits) ---
 if [ -f "$CREDENTIALS" ]; then
     SUBSCRIPTION_TYPE=$(jq -r '.claudeAiOauth.subscriptionType // "unknown"' "$CREDENTIALS")
     RATE_LIMIT_TIER=$(jq -r '.claudeAiOauth.rateLimitTier // "unknown"' "$CREDENTIALS")
 
-    TOKEN=$(jq -r '.claudeAiOauth.accessToken // ""' "$CREDENTIALS")
-    if [ -n "$TOKEN" ]; then
-        API_RESPONSE=$(curl -s --max-time 5 \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -H "anthropic-beta: oauth-2025-04-20" \
-            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '{}')
-
-        FIVE_HOUR_UTIL=$(echo "$API_RESPONSE" | jq -r '.five_hour.utilization // 0')
-        FIVE_HOUR_RESET=$(echo "$API_RESPONSE" | jq -r '.five_hour.resets_at // ""')
-        SEVEN_DAY_UTIL=$(echo "$API_RESPONSE" | jq -r '.seven_day.utilization // 0')
-        SEVEN_DAY_RESET=$(echo "$API_RESPONSE" | jq -r '.seven_day.resets_at // ""')
-        EXTRA_USAGE_ENABLED=$(echo "$API_RESPONSE" | jq -r '.extra_usage.is_enabled // false')
+    # Check if cached usage data is still fresh
+    USE_CACHE=false
+    if [ -f "$USAGE_CACHE" ]; then
+        cache_ts=$(jq -r '.cached_at // 0' "$USAGE_CACHE" 2>/dev/null || echo 0)
+        now_ts=$(date +%s)
+        age=$(( now_ts - cache_ts ))
+        if [ "$age" -lt "$USAGE_CACHE_TTL" ]; then
+            USE_CACHE=true
+        fi
     fi
+
+    if [ "$USE_CACHE" = true ]; then
+        API_RESPONSE=$(jq -r '.data' "$USAGE_CACHE" 2>/dev/null || echo '{}')
+    else
+        TOKEN=$(jq -r '.claudeAiOauth.accessToken // ""' "$CREDENTIALS")
+        if [ -n "$TOKEN" ]; then
+            API_RESPONSE=$(curl -s --max-time 5 \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/json" \
+                -H "Content-Type: application/json" \
+                -H "User-Agent: claude-code/${CLAUDE_VERSION}" \
+                -H "anthropic-beta: oauth-2025-04-20" \
+                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '{}')
+
+            # Cache successful responses (no error field)
+            if echo "$API_RESPONSE" | jq -e '.five_hour' >/dev/null 2>&1; then
+                jq -n --argjson data "$API_RESPONSE" '{cached_at: (now | floor), data: $data}' > "$USAGE_CACHE" 2>/dev/null
+            elif [ -f "$USAGE_CACHE" ]; then
+                # On rate limit or error, use stale cache if available
+                API_RESPONSE=$(jq -r '.data' "$USAGE_CACHE" 2>/dev/null || echo '{}')
+            fi
+        fi
+    fi
+
+    FIVE_HOUR_UTIL=$(echo "$API_RESPONSE" | jq -r '.five_hour.utilization // 0')
+    FIVE_HOUR_RESET=$(echo "$API_RESPONSE" | jq -r '.five_hour.resets_at // ""')
+    SEVEN_DAY_UTIL=$(echo "$API_RESPONSE" | jq -r '.seven_day.utilization // 0')
+    SEVEN_DAY_RESET=$(echo "$API_RESPONSE" | jq -r '.seven_day.resets_at // ""')
+    EXTRA_USAGE_ENABLED=$(echo "$API_RESPONSE" | jq -r '.extra_usage.is_enabled // false')
 fi
 
 # --- Token consumption from JSONL session files ---
 if [ -d "$PROJECTS_DIR" ]; then
-    # Pre-compute rolling 7-day dates (index 1=6 days ago ... index 7=today)
+    # Calendar week dates: Monday (index 1) to Sunday (index 7)
     DAY_DATES=""
-    for i in 6 5 4 3 2 1 0; do
-        d=$(date -d "${i} days ago" +%Y-%m-%d)
+    for i in $(seq 0 6); do
+        d=$(date -d "$WEEK_START + ${i} days" +%Y-%m-%d)
         DAY_DATES="${DAY_DATES:+${DAY_DATES},}${d}"
     done
 
@@ -149,7 +179,7 @@ if [ -d "$PROJECTS_DIR" ]; then
         esac
     done < <(find "$PROJECTS_DIR" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
         | jq -r -R 'fromjson? | select(.type == "assistant") | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
-        | awk -v week_start="$SEVEN_DAYS_AGO" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
+        | awk -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
         BEGIN {
             split(day_dates, dates, ",")
             # Parse pricing: "opus:in:out:cr:cw,sonnet:in:out:cr:cw,haiku:in:out:cr:cw"
@@ -225,7 +255,7 @@ if [ -d "$PROJECTS_DIR" ]; then
                 daily_costs = daily_costs (i > 1 ? "," : "") sprintf("%.2f", val)
             }
             printf "DAILY_COSTS=%s\n", daily_costs
-            printf "TODAY_COST=%.2f\n", (dates[7] in day_cost) ? day_cost[dates[7]] : 0
+            printf "TODAY_COST=%.2f\n", (today in day_cost) ? day_cost[today] : 0
             printf "WEEK_COST=%.2f\n", week_cost + 0
             printf "MONTH_COST=%.2f\n", month_cost + 0
         }')

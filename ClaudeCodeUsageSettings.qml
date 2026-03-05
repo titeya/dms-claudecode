@@ -30,11 +30,12 @@ PluginSettings {
     SliderSetting {
         settingKey: "refreshInterval"
         label: root.tr("Refresh Interval")
-        description: root.tr("How often to fetch usage data (seconds)")
-        defaultValue: 60
-        minimum: 30
-        maximum: 300
-        unit: "s"
+        description: root.tr("How often to fetch usage data (minutes)")
+        defaultValue: 2
+        minimum: 2
+        maximum: 15
+        stepSize: 1
+        unit: "min"
         leftIcon: "schedule"
     }
 }
