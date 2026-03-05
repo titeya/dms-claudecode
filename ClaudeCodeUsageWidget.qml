@@ -14,21 +14,11 @@ PluginComponent {
     property string lang: Qt.locale().name.split(/[_-]/)[0]
     function tr(key) { return Tr.tr(key, lang) }
 
-    // Rolling 7-day labels (index 0 = 6 days ago, index 6 = today)
+    // Calendar week labels: Monday to Sunday (fixed order)
     property int refreshEpoch: 0
-    property var dayLabels: {
-        void(refreshEpoch)
-        var frDays = ["Di", "Lu", "Ma", "Me", "Je", "Ve", "Sa"]
-        var enDays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
-        var days = lang === "fr" ? frDays : enDays
-        var labels = []
-        var now = new Date()
-        for (var i = 6; i >= 0; i--) {
-            var d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i)
-            labels.push(days[d.getDay()])
-        }
-        return labels
-    }
+    property var dayLabels: lang === "fr"
+        ? ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"]
+        : ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 
     // Settings
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
@@ -71,8 +61,12 @@ PluginComponent {
     // Model list
     ListModel { id: modelListData }
 
-    // Today is always the last element in rolling 7-day window
-    property int todayIndex: 6
+    // Today's index in the calendar week (0=Monday, 6=Sunday)
+    property int todayIndex: {
+        void(refreshEpoch)
+        var dow = new Date().getDay() // 0=Sunday, 6=Saturday
+        return dow === 0 ? 6 : dow - 1
+    }
 
     // Derived
     property real maxDaily: Math.max.apply(null, dailyTokens) || 1
@@ -540,7 +534,7 @@ PluginComponent {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                                 StyledText {
-                                    text: root.formatTokens(root.dailyTokens[6])
+                                    text: root.formatTokens(root.dailyTokens[root.todayIndex])
                                     font.pixelSize: Theme.fontSizeLarge
                                     font.weight: Font.DemiBold
                                     color: Theme.primary
