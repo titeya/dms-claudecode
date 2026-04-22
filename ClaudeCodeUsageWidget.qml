@@ -287,6 +287,8 @@ PluginComponent {
             var v = isFloat ? (parseFloat(entry.substring(colon + 1)) || 0) : (parseInt(entry.substring(colon + 1)) || 0);
             if (!_pd[name])
                 _pd[name] = {};
+            else
+                _pd[name] = Object.assign({}, _pd[name]);
             _pd[name][field] = v;
         }
         return _pd;
@@ -309,6 +311,8 @@ PluginComponent {
             var v = entry.substring(colon + 1);
             if (!_pd[name])
                 _pd[name] = {};
+            else
+                _pd[name] = Object.assign({}, _pd[name]);
             _pd[name][field] = v;
         }
         return _pd;
@@ -477,6 +481,8 @@ PluginComponent {
                     var csv1 = blk1.substring(c1 + 1);
                     if (!_pd1[pname1])
                         _pd1[pname1] = {};
+                    else
+                        _pd1[pname1] = Object.assign({}, _pd1[pname1]);
                     var parts1 = csv1.split(",");
                     var arr1 = [];
                     for (var di = 0; di < 7; di++)
@@ -499,6 +505,8 @@ PluginComponent {
                     var csv2 = blk2.substring(c2 + 1);
                     if (!_pd2[pname2])
                         _pd2[pname2] = {};
+                    else
+                        _pd2[pname2] = Object.assign({}, _pd2[pname2]);
                     var parts2 = csv2.split(",");
                     var arr2 = [];
                     for (var dci = 0; dci < 7; dci++)
@@ -521,6 +529,8 @@ PluginComponent {
                     var mcsv = blk3.substring(c3 + 1);
                     if (!_pd3[pname3])
                         _pd3[pname3] = {};
+                    else
+                        _pd3[pname3] = Object.assign({}, _pd3[pname3]);
                     var wms = [];
                     if (mcsv.length > 0) {
                         var mentries = mcsv.split(",");
@@ -743,6 +753,14 @@ PluginComponent {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
                 onClicked: profileDropdownPopup.visible = !profileDropdownPopup.visible
+            }
+
+            MouseArea {
+                id: profileDropdownOverlay
+                visible: profileDropdownPopup.visible
+                anchors.fill: root
+                z: 99
+                onClicked: profileDropdownPopup.visible = false
             }
 
             Rectangle {

@@ -14,7 +14,7 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
   - Weekly activity bar chart (Monday–Sunday) with interactive hover tooltips (token count + cost)
   - Per-model token usage for the current calendar week with dynamic model family detection
   - All-time session and message statistics
-- **CCS profile breakdown** — automatically discovers [CCS](https://github.com/AvengeMedia/ccs) instances in `~/.ccs/instances/` and shows per-profile token/cost stats with a hybrid profile selector (tabs for up to 4 profiles, dropdown for more)
+- **CCS profile breakdown** — automatically discovers [CCS](https://github.com/kaitranntt/ccs) instances in `~/.ccs/instances/` and shows per-profile token/cost stats with a hybrid profile selector (tabs for up to 4 profiles, dropdown for more)
   - Profile overlay on the daily activity chart: grey bars show total usage, colored bars show the selected profile's share
   - Tooltip shows both total and per-profile token counts when a profile is selected
 - **Automatic subscription detection** via the Anthropic OAuth API

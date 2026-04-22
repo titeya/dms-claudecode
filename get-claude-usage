@@ -187,6 +187,8 @@ count_profile_tokens() {
             first = 1
             for (m in week_model) {
                 if (week_model[m] > 0) {
+                    # Use "=" as separator (not ":") because model names like
+                    # "claude-3-5-sonnet:thinking" can contain colons.
                     models = models (first ? "" : ",") m "=" week_model[m]
                     first = 0
                 }
@@ -351,28 +353,28 @@ for idx in "${!TMPFILES[@]}"; do
     [ -f "$tmpf" ] || continue
 
     # Read per-profile token stats
-    p_wt=$(grep "^WEEK_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo 0)
-    p_wm=$(grep "^WEEK_MESSAGES=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo 0)
-    p_ws=$(grep "^WEEK_SESSIONS=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo 0)
-    p_mt=$(grep "^MONTH_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo 0)
-    p_daily=$(grep "^DAILY=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo "0,0,0,0,0,0,0")
+    p_wt=$(grep "^WEEK_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    p_wm=$(grep "^WEEK_MESSAGES=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    p_ws=$(grep "^WEEK_SESSIONS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    p_mt=$(grep "^MONTH_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    p_daily=$(grep "^DAILY=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0,0,0,0,0,0,0")
     p_models=$(grep "^WEEK_MODELS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "")
-    p_dc=$(grep "^DAILY_COSTS=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo "0.00,0.00,0.00,0.00,0.00,0.00,0.00")
-    p_tc=$(grep "^TODAY_COST=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo "0.00")
-    p_wc=$(grep "^WEEK_COST=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo "0.00")
-    p_mc=$(grep "^MONTH_COST=" "$tmpf" 2>/dev/null | cut -d= -f2 || echo "0.00")
+    p_dc=$(grep "^DAILY_COSTS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00,0.00,0.00,0.00,0.00,0.00,0.00")
+    p_tc=$(grep "^TODAY_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
+    p_wc=$(grep "^WEEK_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
+    p_mc=$(grep "^MONTH_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
 
     # Read per-profile usage/subscription
     p_sub="unknown"; p_tier="unknown"
     p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"
     if [ -f "$usage_tmpf" ]; then
-        p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo "unknown")
-        p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo "unknown")
-        p_5u=$(grep "^FIVE_HOUR_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo 0)
-        p_5r=$(grep "^FIVE_HOUR_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo "")
-        p_7u=$(grep "^SEVEN_DAY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo 0)
-        p_7r=$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo "")
-        p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2 || echo "false")
+        p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
+        p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
+        p_5u=$(grep "^FIVE_HOUR_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        p_5r=$(grep "^FIVE_HOUR_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+        p_7u=$(grep "^SEVEN_DAY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        p_7r=$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+        p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
     fi
 
     # Default profile drives the top-level aggregate fields
