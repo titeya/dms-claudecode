@@ -287,18 +287,14 @@ PluginComponent {
             var v = isFloat ? (parseFloat(entry.substring(colon + 1)) || 0) : (parseInt(entry.substring(colon + 1)) || 0);
             if (!_pd[name])
                 _pd[name] = {};
-            else
-                _pd[name] = Object.assign({}, _pd[name]);
             _pd[name][field] = v;
         }
         return _pd;
     }
 
-    // Helper: parse "name:value,..." for string fields (e.g. reset timestamps).
-    // Uses indexOf(":") so ISO 8601 timestamps with colons are handled correctly —
-    // profile names never contain colons, so first colon is always the delimiter.
-    // An empty value after ":" (e.g. "personal:") is intentionally stored as "" —
-    // it is not an error, it means no reset time for that profile.
+    // Uses indexOf(":") so ISO 8601 timestamps (which contain colons) are parsed correctly —
+    // profile names never contain colons, so the first colon is always the name delimiter.
+    // An empty value after ":" (e.g. "personal:") is stored as "" — means no data for that profile.
     function parseProfileString(val, field) {
         var _pd = Object.assign({}, profileData);
         var entries = val.split(",");
@@ -308,12 +304,25 @@ PluginComponent {
             if (colon < 0)
                 continue;
             var name = entry.substring(0, colon);
-            var v = entry.substring(colon + 1);
             if (!_pd[name])
                 _pd[name] = {};
-            else
-                _pd[name] = Object.assign({}, _pd[name]);
-            _pd[name][field] = v;
+            _pd[name][field] = entry.substring(colon + 1);
+        }
+        return _pd;
+    }
+
+    function parseProfileBool(val, field) {
+        var _pd = Object.assign({}, profileData);
+        var entries = val.split(",");
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            var colon = entry.indexOf(":");
+            if (colon < 0)
+                continue;
+            var name = entry.substring(0, colon);
+            if (!_pd[name])
+                _pd[name] = {};
+            _pd[name][field] = entry.substring(colon + 1) === "true";
         }
         return _pd;
     }
@@ -466,7 +475,7 @@ PluginComponent {
             profileData = parseProfileString(val, "sevenDayReset");
             break;
         case "PROFILE_EXTRA_USAGE":
-            profileData = parseProfileString(val, "extraUsageEnabled");
+            profileData = parseProfileBool(val, "extraUsageEnabled");
             break;
         case "PROFILE_DAILY":
             {
@@ -1242,7 +1251,7 @@ PluginComponent {
                                     if (root.hoveredDay < 0)
                                         return "";
                                     var t = root.formatTokens(root.dailyTokens[root.hoveredDay]);
-                                    return root.selectedProfile !== "all" ? t + " total" : t;
+                                    return root.selectedProfile !== "all" ? t + " " + root.tr("total") : t;
                                 }
                                 font.pixelSize: 11
                                 font.weight: Font.DemiBold

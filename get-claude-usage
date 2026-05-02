@@ -287,7 +287,8 @@ CCS_INSTANCES_DIR="${HOME}/.ccs/instances"
 if [ -d "$CCS_INSTANCES_DIR" ]; then
     for inst in "$CCS_INSTANCES_DIR"/*/; do
         [ -d "${inst}projects" ] || continue
-        name=$(basename "$inst")
+        name=$(basename "$inst" | tr -d ',|:')
+        [ -z "$name" ] && continue
         PROFILE_DIRS+=("${inst}projects")
         PROFILE_NAMES+=("$name")
         PROFILE_CREDS+=("${inst}.credentials.json")
