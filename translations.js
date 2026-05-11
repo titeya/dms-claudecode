@@ -44,6 +44,8 @@ var strings = {
         { fr: "Tout" },
     "Profile":
         { fr: "Profil" },
+    "total":
+        { fr: "total" },
 }
 
 function tr(key, lang) {

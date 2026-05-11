@@ -287,6 +287,8 @@ PluginComponent {
             var v = isFloat ? (parseFloat(entry.substring(colon + 1)) || 0) : (parseInt(entry.substring(colon + 1)) || 0);
             if (!_pd[name])
                 _pd[name] = {};
+            else
+                _pd[name] = Object.assign({}, _pd[name]);
             _pd[name][field] = v;
         }
         return _pd;
@@ -306,6 +308,8 @@ PluginComponent {
             var name = entry.substring(0, colon);
             if (!_pd[name])
                 _pd[name] = {};
+            else
+                _pd[name] = Object.assign({}, _pd[name]);
             _pd[name][field] = entry.substring(colon + 1);
         }
         return _pd;
@@ -322,6 +326,8 @@ PluginComponent {
             var name = entry.substring(0, colon);
             if (!_pd[name])
                 _pd[name] = {};
+            else
+                _pd[name] = Object.assign({}, _pd[name]);
             _pd[name][field] = entry.substring(colon + 1) === "true";
         }
         return _pd;
