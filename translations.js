@@ -13,6 +13,20 @@ var strings = {
         { fr: "Réinitialisation dans", es: "Restablecimiento en" },
     "Resetting...":
         { fr: "Réinitialisation...", es: "Restableciendo..." },
+    "old":
+        { fr: "d'ancienneté", es: "de antigüedad" },
+    "Claude Code login expired":
+        { fr: "Session Claude Code expirée", es: "Sesión de Claude Code caducada" },
+    "API rate limited":
+        { fr: "Limite de l'API atteinte", es: "Límite de la API alcanzado" },
+    "Not authorized":
+        { fr: "Non autorisé", es: "No autorizado" },
+    "No connection":
+        { fr: "Pas de connexion", es: "Sin conexión" },
+    "Not signed in":
+        { fr: "Non connecté", es: "No has iniciado sesión" },
+    "Unexpected API response":
+        { fr: "Réponse inattendue de l'API", es: "Respuesta inesperada de la API" },
     "7-Day Usage":
         { fr: "Utilisation sur 7 jours", es: "Uso durante 7 días" },
     "sessions":

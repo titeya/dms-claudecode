@@ -39,6 +39,11 @@ PluginComponent {
     property real sevenDayUtil: 0
     property string sevenDayReset: ""
     property bool extraUsageEnabled: false
+    // How much the rate limit numbers above can be trusted. usageError is empty
+    // when the last fetch succeeded; otherwise usageAge is how old the numbers
+    // being shown are, in seconds (0 = there is no data at all).
+    property int usageAge: 0
+    property string usageError: ""
 
     // Weekly state
     property int weekMessages: 0
@@ -101,6 +106,23 @@ PluginComponent {
     property string displayFiveHourReset: currentPd && currentPd.fiveHourReset !== undefined ? currentPd.fiveHourReset : fiveHourReset
     property real displaySevenDayUtil: currentPd && currentPd.sevenDayUtil !== undefined ? currentPd.sevenDayUtil : sevenDayUtil
     property string displaySevenDayReset: currentPd && currentPd.sevenDayReset !== undefined ? currentPd.sevenDayReset : sevenDayReset
+    property int displayUsageAge: currentPd && currentPd.usageAge !== undefined ? currentPd.usageAge : usageAge
+    property string displayUsageError: currentPd && currentPd.usageError !== undefined ? currentPd.usageError : usageError
+
+    // One line telling the user the rate limit numbers are not live, and why.
+    // Empty while the fetch is healthy, which is the normal case.
+    property string usageWarning: {
+        if (!displayUsageError)
+            return "";
+        var reason = usageErrorLabel(displayUsageError);
+        if (displayUsageAge <= 0)
+            return reason;
+        return formatAge(displayUsageAge) + " " + tr("old") + " · " + reason;
+    }
+    // Suffix for every rate limit percentage that came from a failed fetch, so a
+    // number is never presented as live. The reason itself is printed once, in
+    // the 5h card, rather than repeated under each ring.
+    property string staleMark: usageWarning === "" ? "" : "?"
     property real displayWeekTokens: currentPd && currentPd.weekTokens !== undefined ? currentPd.weekTokens : weekTokens
     property int displayWeekMessages: currentPd && currentPd.weekMessages !== undefined ? currentPd.weekMessages : weekMessages
     property int displayWeekSessions: currentPd && currentPd.weekSessions !== undefined ? currentPd.weekSessions : weekSessions
@@ -237,6 +259,38 @@ PluginComponent {
         if (n >= 1000)
             return (n / 1000).toFixed(1) + "K";
         return Math.round(n).toString();
+    }
+
+    // Seconds → "45m" / "3h 37m" / "2d 4h". Used for how old stale numbers are.
+    function formatAge(seconds) {
+        if (!(seconds > 0))
+            return "0m";
+        var mins = Math.floor(seconds / 60);
+        if (mins < 60)
+            return mins + "m";
+        var hours = Math.floor(mins / 60);
+        if (hours < 24)
+            return hours + "h " + (mins % 60) + "m";
+        return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
+    }
+
+    function usageErrorLabel(code) {
+        switch (code) {
+        case "token_expired":
+            return tr("Claude Code login expired");
+        case "rate_limited":
+            return tr("API rate limited");
+        case "unauthorized":
+            return tr("Not authorized");
+        case "offline":
+            return tr("No connection");
+        case "no_credentials":
+            return tr("Not signed in");
+        case "bad_response":
+            return tr("Unexpected API response");
+        default:
+            return code;
+        }
     }
 
     function shortModelName(name) {
@@ -474,6 +528,12 @@ PluginComponent {
         case "EXTRA_USAGE_ENABLED":
             extraUsageEnabled = (val === "true");
             break;
+        case "USAGE_AGE":
+            usageAge = parseInt(val) || 0;
+            break;
+        case "USAGE_ERROR":
+            usageError = val;
+            break;
         case "WEEK_MESSAGES":
             weekMessages = parseInt(val) || 0;
             break;
@@ -600,6 +660,12 @@ PluginComponent {
             break;
         case "PROFILE_EXTRA_USAGE":
             profileData = parseProfileBool(val, "extraUsageEnabled");
+            break;
+        case "PROFILE_USAGE_AGE":
+            profileData = parseProfileSimple(val, "usageAge", false);
+            break;
+        case "PROFILE_USAGE_ERROR":
+            profileData = parseProfileString(val, "usageError");
             break;
         case "PROFILE_DAILY":
             {
@@ -739,6 +805,9 @@ PluginComponent {
     horizontalBarPill: Component {
         Row {
             spacing: Theme.spacingXS
+            // Dimmed with a "?" suffix while the numbers are not live, so the bar
+            // never states a percentage it cannot back up. Details in the popout.
+            opacity: root.usageError !== "" ? 0.6 : 1
 
             Canvas {
                 id: hRing
@@ -775,9 +844,9 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.fiveHourUtil) + "%" + (root.usageError !== "" ? "?" : (root.pillOverPace ? " ↑" : ""))
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
-                color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
+                color: root.usageError === "" && root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
                 anchors.verticalCenter: parent.verticalCenter
             }
         }
@@ -786,6 +855,7 @@ PluginComponent {
     verticalBarPill: Component {
         Column {
             spacing: Theme.spacingXS || 4
+            opacity: root.usageError !== "" ? 0.6 : 1
 
             Canvas {
                 id: vRing
@@ -822,9 +892,9 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.fiveHourUtil) + "%" + (root.usageError !== "" ? "?" : (root.pillOverPace ? " ↑" : ""))
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
-                color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
+                color: root.usageError === "" && root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
                 anchors.horizontalCenter: parent.horizontalCenter
             }
         }
@@ -1048,7 +1118,7 @@ PluginComponent {
 
                             StyledText {
                                 anchors.centerIn: parent
-                                text: Math.round(root.displayFiveHourUtil) + "%"
+                                text: Math.round(root.displayFiveHourUtil) + "%" + root.staleMark
                                 font.pixelSize: Theme.fontSizeXLarge
                                 font.weight: Font.DemiBold
                                 color: Theme.surfaceText
@@ -1070,7 +1140,7 @@ PluginComponent {
                             }
                             StyledText {
                                 width: parent.width
-                                text: Math.round(root.displayFiveHourUtil) + "% " + root.tr("used")
+                                text: Math.round(root.displayFiveHourUtil) + "%" + root.staleMark + " " + root.tr("used")
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: root.progressColor(root.displayFiveHourUtil)
                                 wrapMode: Text.WordWrap
@@ -1078,7 +1148,7 @@ PluginComponent {
                             StyledText {
                                 width: parent.width
                                 text: root.paceLabel(root.fiveHourPace)
-                                visible: root.showPacing && text !== ""
+                                visible: root.showPacing && root.usageWarning === "" && text !== ""
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: root.paceColor(root.fiveHourPace.status)
                                 wrapMode: Text.WordWrap
@@ -1088,7 +1158,18 @@ PluginComponent {
                                 text: root.displayFiveHourCountdown ? root.tr("Resets in") + " " + root.displayFiveHourCountdown : ""
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: Theme.surfaceVariantText
-                                visible: root.displayFiveHourCountdown !== ""
+                                // Hidden while the numbers are not live: the reset time comes
+                                // from the same stale response, so it counts down to an instant
+                                // that has already passed and reads "Resetting..." forever.
+                                visible: root.usageWarning === "" && root.displayFiveHourCountdown !== ""
+                                wrapMode: Text.WordWrap
+                            }
+                            StyledText {
+                                width: parent.width
+                                text: root.usageWarning
+                                visible: root.usageWarning !== ""
+                                font.pixelSize: Theme.fontSizeMedium
+                                color: Theme.error
                                 wrapMode: Text.WordWrap
                             }
                         }
@@ -1145,7 +1226,7 @@ PluginComponent {
 
                             StyledText {
                                 anchors.centerIn: parent
-                                text: Math.round(root.displaySevenDayUtil) + "%"
+                                text: Math.round(root.displaySevenDayUtil) + "%" + root.staleMark
                                 font.pixelSize: 14
                                 font.weight: Font.DemiBold
                                 color: Theme.surfaceText
@@ -1159,7 +1240,7 @@ PluginComponent {
 
                             StyledText {
                                 width: parent.width
-                                text: root.tr("7-Day Usage") + " · " + Math.round(root.displaySevenDayUtil) + "%"
+                                text: root.tr("7-Day Usage") + " · " + Math.round(root.displaySevenDayUtil) + "%" + root.staleMark
                                 font.pixelSize: Theme.fontSizeMedium
                                 font.weight: Font.Medium
                                 color: Theme.surfaceText
@@ -1168,7 +1249,7 @@ PluginComponent {
                             StyledText {
                                 width: parent.width
                                 text: root.paceLabel(root.sevenDayPace)
-                                visible: root.showPacing && text !== ""
+                                visible: root.showPacing && root.usageWarning === "" && text !== ""
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: root.paceColor(root.sevenDayPace.status)
                                 wrapMode: Text.WordWrap
@@ -1193,7 +1274,7 @@ PluginComponent {
                                 text: root.displaySevenDayCountdown ? root.tr("Resets in") + " " + root.displaySevenDayCountdown : ""
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
-                                visible: root.displaySevenDayCountdown !== ""
+                                visible: root.usageWarning === "" && root.displaySevenDayCountdown !== ""
                                 wrapMode: Text.WordWrap
                             }
                         }

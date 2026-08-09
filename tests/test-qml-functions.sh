@@ -100,6 +100,8 @@ function parseLine(line, state) {
     case "SEVEN_DAY_UTIL": state.sevenDayUtil = parseFloat(val) || 0; break
     case "SEVEN_DAY_RESET": state.sevenDayReset = val; break
     case "EXTRA_USAGE_ENABLED": state.extraUsageEnabled = (val === "true"); break
+    case "USAGE_AGE": state.usageAge = parseInt(val) || 0; break
+    case "USAGE_ERROR": state.usageError = val; break
     case "WEEK_MESSAGES": state.weekMessages = parseInt(val) || 0; break
     case "WEEK_SESSIONS": state.weekSessions = parseInt(val) || 0; break
     case "WEEK_TOKENS": state.weekTokens = parseFloat(val) || 0; break
@@ -138,6 +140,34 @@ function parseLine(line, state) {
         break
     }
     return state
+}
+
+function formatAge(seconds) {
+    if (!(seconds > 0)) return "0m"
+    var mins = Math.floor(seconds / 60)
+    if (mins < 60) return mins + "m"
+    var hours = Math.floor(mins / 60)
+    if (hours < 24) return hours + "h " + (mins % 60) + "m"
+    return Math.floor(hours / 24) + "d " + (hours % 24) + "h"
+}
+
+function usageErrorLabel(code) {
+    switch (code) {
+    case "token_expired": return tr("Claude Code login expired")
+    case "rate_limited": return tr("API rate limited")
+    case "unauthorized": return tr("Not authorized")
+    case "offline": return tr("No connection")
+    case "no_credentials": return tr("Not signed in")
+    case "bad_response": return tr("Unexpected API response")
+    default: return code
+    }
+}
+
+function usageWarning(age, err) {
+    if (!err) return ""
+    var reason = usageErrorLabel(err)
+    if (age <= 0) return reason
+    return formatAge(age) + " " + tr("old") + " \u00b7 " + reason
 }
 '
 
@@ -424,6 +454,43 @@ if [ "$RESULT_MODELS_BAD" = '[{"modelName":"opus","modelTokens":5000},{"modelNam
 else
     fail "parseLine WEEK_MODELS malformed expected opus+sonnet only, got $RESULT_MODELS_BAD"
 fi
+
+# ============================================================
+echo "=== Test 8: formatAge / usageWarning ==="
+# ============================================================
+
+test_expr() {
+    local expr="$1" expected="$2" desc="$3" out
+    out=$(run_js "${JS_HARNESS} console.log($expr)")
+    if [ "$out" = "$expected" ]; then
+        pass "$desc"
+    else
+        fail "$desc expected '$expected', got '$out'"
+    fi
+}
+
+test_expr "formatAge(0)" "0m" "formatAge(0) = 0m"
+test_expr "formatAge(-5)" "0m" "formatAge(negative) = 0m"
+test_expr "formatAge(59)" "0m" "formatAge(59s) = 0m"
+test_expr "formatAge(60)" "1m" "formatAge(60s) = 1m"
+test_expr "formatAge(3540)" "59m" "formatAge(59m) = 59m"
+test_expr "formatAge(3600)" "1h 0m" "formatAge(1h) = 1h 0m"
+test_expr "formatAge(12990)" "3h 36m" "formatAge(3h36m) = 3h 36m"
+test_expr "formatAge(86400)" "1d 0h" "formatAge(1d) = 1d 0h"
+test_expr "formatAge(187200)" "2d 4h" "formatAge(2d4h) = 2d 4h"
+
+# A healthy fetch must produce no warning at all, whatever the age is
+test_expr "JSON.stringify(usageWarning(0, ''))" '""' "usageWarning silent when no error"
+test_expr "JSON.stringify(usageWarning(99999, ''))" '""' "usageWarning silent on age alone"
+
+test_expr "usageWarning(12990, 'token_expired')" \
+    "3h 36m old · Claude Code login expired" "usageWarning stale token"
+test_expr "usageWarning(0, 'no_credentials')" \
+    "Not signed in" "usageWarning drops age when there is no cached data"
+test_expr "usageWarning(120, 'offline')" \
+    "2m old · No connection" "usageWarning offline"
+test_expr "usageWarning(60, 'http_500')" \
+    "1m old · http_500" "usageWarning passes unknown codes through"
 
 # ============================================================
 echo ""
