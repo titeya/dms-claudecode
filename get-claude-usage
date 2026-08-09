@@ -11,6 +11,15 @@ USAGE_CACHE="${CLAUDE_DIR}/usage-cache.json"
 USAGE_CACHE_TTL=90  # seconds, below the 2 min minimum refresh interval
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
+# `--force` (manual refresh from the popout) skips the usage cache TTL, so a
+# user who just fixed a dead login sees it immediately instead of waiting for
+# the cache to age out. Profile arguments are `name=path`, so a bare flag can
+# never collide with one.
+FORCE_FETCH=false
+for arg in "$@"; do
+    [ "$arg" = "--force" ] && FORCE_FETCH=true
+done
+
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
 TODAY=$(date +%Y-%m-%d)
 # Calendar week: Monday to Sunday
@@ -304,7 +313,9 @@ fetch_profile_usage() {
         [[ "$cache_ts" =~ ^[0-9]+$ ]] || cache_ts=0
         cache_age=$(( now_ts - cache_ts ))
         [ "$cache_age" -lt 0 ] && cache_age=0
-        [ "$cache_matches" = true ] && [ "$cache_age" -lt "$USAGE_CACHE_TTL" ] && use_cache=true
+        if [ "$FORCE_FETCH" != true ] && [ "$cache_matches" = true ] && [ "$cache_age" -lt "$USAGE_CACHE_TTL" ]; then
+            use_cache=true
+        fi
     fi
 
     if [ "$use_cache" = true ]; then

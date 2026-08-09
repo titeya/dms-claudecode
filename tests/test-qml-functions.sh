@@ -153,7 +153,7 @@ function formatAge(seconds) {
 
 function usageErrorLabel(code) {
     switch (code) {
-    case "token_expired": return tr("Claude Code login expired")
+    case "token_expired": return tr("Claude Code login expired - run claude once")
     case "rate_limited": return tr("API rate limited")
     case "unauthorized": return tr("Not authorized")
     case "offline": return tr("No connection")
@@ -484,7 +484,7 @@ test_expr "JSON.stringify(usageWarning(0, ''))" '""' "usageWarning silent when n
 test_expr "JSON.stringify(usageWarning(99999, ''))" '""' "usageWarning silent on age alone"
 
 test_expr "usageWarning(12990, 'token_expired')" \
-    "3h 36m old · Claude Code login expired" "usageWarning stale token"
+    "3h 36m old · Claude Code login expired - run claude once" "usageWarning stale token"
 test_expr "usageWarning(0, 'no_credentials')" \
     "Not signed in" "usageWarning drops age when there is no cached data"
 test_expr "usageWarning(120, 'offline')" \

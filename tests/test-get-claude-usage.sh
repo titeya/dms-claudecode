@@ -823,5 +823,26 @@ assert_match "$(usage_field "$OUT28C" PROFILE_USAGE_AGE)" "default:[0-9]+" \
 
 # ============================================================
 echo ""
+echo "=== Test 29: --force bypasses the usage cache ==="
+# ============================================================
+# The popout refresh button passes `--force`. With a fresh cache on disk saying
+# 42 and the API saying 7, a plain run serves the cache and a forced run refetches
+# - otherwise the manual refresh would replay the numbers the user clicked to
+# get rid of. The flag must also never be mistaken for a `name=path` profile.
+ENV29=$(setup_env "test29")
+write_creds "$ENV29" "$FUTURE_MS"
+write_usage_cache "$ENV29" "$(date +%s)" 42
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY='{"five_hour":{"utilization":7,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":2,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+
+assert_eq "$(usage_field "$(run_script "$ENV29")" FIVE_HOUR_UTIL)" "42" \
+    "fresh cache serves the cached number"
+OUT29=$(run_script "$ENV29" --force)
+assert_eq "$(usage_field "$OUT29" FIVE_HOUR_UTIL)" "7" "--force refetches past a fresh cache"
+assert_eq "$(usage_field "$OUT29" PROFILES)" "default" "--force is not registered as a profile"
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+# ============================================================
+echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
