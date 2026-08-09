@@ -27,11 +27,17 @@ setup_env() {
     echo "$dir"
 }
 
-# Mock curl: always returns empty JSON (avoids real network calls)
+# Mock curl: avoids real network calls. Mirrors `curl -w '\n%{http_code}'` — body
+# first, then the status on its own line. Tests drive it with MOCK_CURL_BODY and
+# MOCK_CURL_CODE; unset means "empty JSON, no status line", i.e. an unreachable API.
 mock_curl="$TMPDIR_ROOT/curl"
 cat > "$mock_curl" << 'CURLEOF'
 #!/usr/bin/env bash
-echo '{}'
+body="${MOCK_CURL_BODY-}"
+[ -n "$body" ] || body='{}'
+printf '%s' "$body"
+[ -n "${MOCK_CURL_CODE-}" ] && printf '\n%s' "$MOCK_CURL_CODE"
+exit 0
 CURLEOF
 chmod +x "$mock_curl"
 
@@ -51,12 +57,12 @@ make_jsonl_line() {
 }
 
 # ============================================================
-echo "=== Test 1: Output format — all 21 keys present ==="
+echo "=== Test 1: Output format — all 23 keys present ==="
 # ============================================================
 ENV1=$(setup_env "test1")
 OUTPUT1=$(run_script "$ENV1")
 
-EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
+EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED USAGE_AGE USAGE_ERROR WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
 for key in $EXPECTED_KEYS; do
     if echo "$OUTPUT1" | grep -q "^${key}="; then
         pass "key $key present"
@@ -714,6 +720,106 @@ if echo "$PROFILES27C" | tr ',' '\n' | grep -q '^alias$'; then
 else
     pass "duplicate config directory registered only once"
 fi
+
+# ============================================================
+echo "=== Test 28: USAGE_ERROR / USAGE_AGE report fetch trust ==="
+# ============================================================
+ENV28=$(setup_env "test28")
+
+write_creds() {
+    # Usage: write_creds <env_dir> <expiresAt_ms>
+    cat > "$1/.claude/.credentials.json" << CRED28EOF
+{
+    "claudeAiOauth": {
+        "subscriptionType": "pro",
+        "rateLimitTier": "t1_pro",
+        "accessToken": "fake-token",
+        "expiresAt": $2
+    }
+}
+CRED28EOF
+}
+
+write_usage_cache() {
+    # Usage: write_usage_cache <env_dir> <cached_at> <five_hour_util>
+    cat > "$1/.claude/usage-cache.json" << CACHE28EOF
+{
+    "cached_at": $2,
+    "identity": "$1/.claude/.credentials.json",
+    "data": {
+        "five_hour": {"utilization": $3, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 7, "resets_at": "2099-01-07T00:00:00Z"},
+        "extra_usage": {"is_enabled": false}
+    }
+}
+CACHE28EOF
+}
+
+usage_field() { echo "$1" | grep "^$2=" | cut -d= -f2-; }
+
+NOW28=$(date +%s)
+FUTURE_MS=$(( (NOW28 + 3600) * 1000 ))
+PAST_MS=$(( (NOW28 - 3600) * 1000 ))
+
+# No credentials at all
+OUT28A=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28A" USAGE_ERROR)" "no_credentials" "no credentials → no_credentials"
+assert_eq "$(usage_field "$OUT28A" USAGE_AGE)" "0" "no credentials → USAGE_AGE=0"
+
+# Live token, API refuses, nothing cached → error with no age, numbers stay 0
+write_creds "$ENV28" "$FUTURE_MS"
+export MOCK_CURL_CODE=429
+OUT28B=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28B" USAGE_ERROR)" "rate_limited" "HTTP 429 → rate_limited"
+assert_eq "$(usage_field "$OUT28B" USAGE_AGE)" "0" "429 without cache → USAGE_AGE=0"
+assert_eq "$(usage_field "$OUT28B" FIVE_HOUR_UTIL)" "0" "429 without cache → no invented utilization"
+
+# Same failure, but a stale cache exists → cached numbers served WITH their age
+write_usage_cache "$ENV28" "$(( NOW28 - 3600 ))" 42
+OUT28C=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28C" USAGE_ERROR)" "rate_limited" "stale cache keeps the failure reason"
+assert_eq "$(usage_field "$OUT28C" FIVE_HOUR_UTIL)" "42" "stale cache still provides utilization"
+AGE28C=$(usage_field "$OUT28C" USAGE_AGE)
+if [ "$AGE28C" -ge 3600 ] && [ "$AGE28C" -lt 3660 ]; then
+    pass "stale cache reports its age (~3600s, got ${AGE28C}s)"
+else
+    fail "stale cache age expected ~3600s, got '${AGE28C}s'"
+fi
+
+# 401/403 and an unreachable API get their own reasons
+export MOCK_CURL_CODE=401
+assert_eq "$(usage_field "$(run_script "$ENV28")" USAGE_ERROR)" "unauthorized" "HTTP 401 → unauthorized"
+unset MOCK_CURL_CODE
+assert_eq "$(usage_field "$(run_script "$ENV28")" USAGE_ERROR)" "offline" "no HTTP status → offline"
+
+# An expired login outranks the HTTP code: it is the cause the user can act on
+write_creds "$ENV28" "$PAST_MS"
+export MOCK_CURL_CODE=429
+assert_eq "$(usage_field "$(run_script "$ENV28")" USAGE_ERROR)" "token_expired" \
+    "expired token wins over the HTTP code"
+unset MOCK_CURL_CODE
+
+# A successful fetch must clear the warning even though a stale cache is on disk
+write_creds "$ENV28" "$FUTURE_MS"
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY='{"five_hour":{"utilization":3,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":1,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+OUT28D=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28D" USAGE_ERROR)" "" "successful fetch → empty USAGE_ERROR"
+assert_eq "$(usage_field "$OUT28D" USAGE_AGE)" "0" "successful fetch → USAGE_AGE=0"
+assert_eq "$(usage_field "$OUT28D" FIVE_HOUR_UTIL)" "3" "successful fetch → live utilization"
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+# A cache inside the TTL is a normal hit, not a stale read
+write_usage_cache "$ENV28" "$NOW28" 42
+OUT28E=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28E" USAGE_ERROR)" "" "fresh cache → no warning"
+assert_eq "$(usage_field "$OUT28E" USAGE_AGE)" "0" "fresh cache → USAGE_AGE=0"
+
+# Per-profile lists carry the same two fields
+assert_match "$(usage_field "$OUT28C" PROFILE_USAGE_ERROR)" "default:rate_limited" \
+    "PROFILE_USAGE_ERROR names the profile"
+assert_match "$(usage_field "$OUT28C" PROFILE_USAGE_AGE)" "default:[0-9]+" \
+    "PROFILE_USAGE_AGE names the profile"
 
 # ============================================================
 echo ""
