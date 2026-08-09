@@ -15,8 +15,8 @@ var strings = {
         { fr: "Réinitialisation...", es: "Restableciendo..." },
     "old":
         { fr: "d'ancienneté", es: "de antigüedad" },
-    "Claude Code login expired":
-        { fr: "Session Claude Code expirée", es: "Sesión de Claude Code caducada" },
+    "Claude Code login expired - run claude once":
+        { fr: "Session Claude Code expirée - lancez claude une fois", es: "Sesión de Claude Code caducada - ejecuta claude una vez" },
     "API rate limited":
         { fr: "Limite de l'API atteinte", es: "Límite de la API alcanzado" },
     "Not authorized":

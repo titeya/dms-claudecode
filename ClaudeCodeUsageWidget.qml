@@ -29,7 +29,19 @@ PluginComponent {
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
     property bool showPacing: pluginData.showPacing !== false
     property var customProfiles: pluginData.customProfiles || []
-    property bool customProfilesRefreshPending: false
+    // A refresh asked for while one is already in flight. onExited starts it,
+    // so the request is queued rather than dropped.
+    property bool rerunPending: false
+    // Passed to the script as `--force`: manual refresh ignores the usage cache.
+    property bool forceFetch: false
+    // True while the run currently executing is one the user asked for. Read at
+    // exit to decide whether anybody is waiting for a verdict.
+    property bool forcedRunInFlight: false
+    // "ok" | "fail" | "" - the outcome of the last manual refresh, shown on the
+    // button for a few seconds.
+    property string refreshResult: ""
+    // Drives the spinner on the popout refresh button.
+    readonly property bool refreshing: usageProcess.running
 
     // API usage data
     property string subscriptionType: ""
@@ -277,7 +289,9 @@ PluginComponent {
     function usageErrorLabel(code) {
         switch (code) {
         case "token_expired":
-            return tr("Claude Code login expired");
+            // Names the fix, not just the fault: the plugin cannot refresh the
+            // token, only Claude Code itself can, by being run once.
+            return tr("Claude Code login expired - run claude once");
         case "rate_limited":
             return tr("API rate limited");
         case "unauthorized":
@@ -753,13 +767,26 @@ PluginComponent {
 
     // --- Data fetching ---
 
-    // Pick up an added/removed profile now instead of waiting for the refresh timer
-    onCustomProfilesChanged: {
+    // Start a run now, or queue one when a run is already in flight.
+    function rerun() {
         if (usageProcess.running)
-            customProfilesRefreshPending = true;
+            rerunPending = true;
         else
             usageProcess.running = true;
     }
+
+    // Manual refresh from the popout header. Skips the script's usage cache, so
+    // it is also the way out of a stale warning once the login is fixed - the
+    // refresh interval can be 15 minutes, which is a long time to stare at a
+    // warning you have already dealt with.
+    function refreshNow() {
+        refreshResult = "";
+        forceFetch = true;
+        rerun();
+    }
+
+    // Pick up an added/removed profile now instead of waiting for the refresh timer
+    onCustomProfilesChanged: rerun()
 
     Process {
         id: usageProcess
@@ -767,11 +794,23 @@ PluginComponent {
         // while `running` is true, so a single run that never exits (a hung
         // `claude --version`, a stalled curl/find) freezes the widget on stale
         // values until the plugin is reloaded. Killing the run lets onExited fire.
-        command: ["timeout", "120", "bash", root.scriptPath].concat(root.customProfiles.filter(p => p && p.name && p.path).map(p => p.name + "=" + p.path))
+        // `--force` makes the script skip its usage cache TTL, so the manual
+        // refresh actually refetches instead of replaying the same cached
+        // response. Profile arguments are `name=path`, never a bare flag.
+        command: ["timeout", "120", "bash", root.scriptPath].concat(root.forceFetch ? ["--force"] : []).concat(root.customProfiles.filter(p => p && p.name && p.path).map(p => p.name + "=" + p.path))
         running: false
 
         stdout: SplitParser {
             onRead: data => root.parseLine(data.trim())
+        }
+
+        // A forced run is the only one a user is waiting on, so its outcome is
+        // reported on the button. Without this a click that ends in the same
+        // numbers - the usual case when the login is dead - looks like a button
+        // that does nothing.
+        onRunningChanged: {
+            if (running)
+                root.forcedRunInFlight = root.forceFetch;
         }
 
         onExited: (exitCode, exitStatus) => {
@@ -779,14 +818,33 @@ PluginComponent {
                 root.isLoading = false;
                 root.refreshEpoch++;
             }
-            if (root.customProfilesRefreshPending) {
-                root.customProfilesRefreshPending = false;
+            if (root.forcedRunInFlight) {
+                root.forcedRunInFlight = false;
+                root.refreshResult = (exitCode === 0 && root.usageError === "") ? "ok" : "fail";
+                refreshResultTimer.restart();
+            }
+            // A run requested while another was in flight is honoured now. The
+            // force flag survives until the run that was asked for has started,
+            // otherwise a manual refresh queued behind a timer tick would lose it.
+            if (root.rerunPending) {
+                root.rerunPending = false;
                 Qt.callLater(function() {
                     if (!usageProcess.running)
                         usageProcess.running = true;
                 });
+            } else {
+                root.forceFetch = false;
             }
         }
+    }
+
+    // Lives on the widget, not in the popout: the popout may be closed before a
+    // slow run finishes, and a dangling timer in a destroyed component would
+    // leave refreshResult set forever.
+    Timer {
+        id: refreshResultTimer
+        interval: 3000
+        onTriggered: root.refreshResult = ""
     }
 
     Timer {
@@ -1045,6 +1103,56 @@ PluginComponent {
                 return label ? root.tr("Subscription") + ": " + label : "";
             }
             showCloseButton: true
+
+            // Manual refresh, styled after the close button next to it. Spins
+            // while a run is in flight, which is also the only feedback that a
+            // click did anything when the numbers come back unchanged.
+            headerActions: Component {
+                Rectangle {
+                    width: 32
+                    height: 32
+                    radius: 16
+                    color: refreshArea.containsMouse ? Theme.withAlpha(Theme.primary, 0.12) : "transparent"
+
+                    DankIcon {
+                        id: refreshIcon
+                        anchors.centerIn: parent
+                        // The icon carries the verdict for a few seconds: a check
+                        // when the numbers are live again, an error mark when the
+                        // fetch failed and the warning below still stands.
+                        name: root.refreshResult === "ok" ? "check" : root.refreshResult === "fail" ? "error" : "refresh"
+                        size: Theme.iconSize - 4
+                        color: {
+                            if (root.refreshResult === "fail")
+                                return Theme.error;
+                            if (root.refreshResult === "ok")
+                                return Theme.primary;
+                            return refreshArea.containsMouse ? Theme.primary : Theme.surfaceVariantText;
+                        }
+
+                        RotationAnimator {
+                            target: refreshIcon
+                            from: 0
+                            to: 360
+                            duration: 1000
+                            loops: Animation.Infinite
+                            running: root.refreshing
+                            onRunningChanged: {
+                                if (!running)
+                                    refreshIcon.rotation = 0;
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        id: refreshArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.refreshNow()
+                    }
+                }
+            }
 
             Column {
                 width: parent.width - Theme.spacingM * 2

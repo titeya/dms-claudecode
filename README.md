@@ -9,7 +9,8 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
 - **Taskbar pill** with circular progress ring showing 5-hour rate limit utilization
 - **Detailed popout** with:
   - 5-hour and 7-day rate window utilization with countdown timers
-  - Stale-data warning when the usage API cannot be reached — the pill dims and adds `?`, and the popout says how old the numbers are and why the fetch failed (e.g. `3h 40m old · Claude Code login expired`), instead of presenting cached numbers as live
+  - Stale-data warning when the usage API cannot be reached — the pill dims and adds `?`, and the popout says how old the numbers are and what to do about it (e.g. `3h 40m old · Claude Code login expired - run claude once`), instead of presenting cached numbers as live
+  - Refresh button in the popout header for an immediate fetch that ignores the cache — after fixing an expired login you see the real numbers straight away instead of waiting out the refresh interval
   - Pacing indicator showing whether you're over or under a linear burn rate for each window (e.g. "6% over pace", "25% under pace")
   - Token consumption breakdown (today, calendar week, calendar month)
   - Estimated API cost per period (today, calendar week, calendar month) with automatic pricing from [LiteLLM](https://github.com/BerriAI/litellm)
@@ -86,7 +87,7 @@ The plugin runs a lightweight bash script at the configured interval that:
 3. Scans `<config dir>/projects/` for every discovered profile (see above) for token consumption statistics — each profile is processed in parallel
 4. Fetches model pricing from LiteLLM and USD/EUR exchange rate from ECB (cached daily in `~/.claude/pricing-cache.json`)
 
-API usage responses are cached for 90 seconds (`~/.claude/usage-cache.json`) to avoid rate limiting. If a fetch fails the cached numbers are still shown, but they are labelled with their age and the reason the fetch failed — an expired login in `~/.claude/.credentials.json` (run `claude` once to refresh it), a rate limit, or no connection.
+API usage responses are cached for 90 seconds (`~/.claude/usage-cache.json`) to avoid rate limiting; the popout refresh button skips that cache. If a fetch fails the cached numbers are still shown, but they are labelled with their age and the reason the fetch failed — an expired login in `~/.claude/.credentials.json` (run `claude` once to refresh it), a rate limit, or no connection.
 
 All data stays local. Network requests are limited to the official Anthropic API (usage), GitHub (LiteLLM pricing, once/day), and Frankfurter (exchange rate, once/day).
 
