@@ -22,9 +22,9 @@ done
 
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
 TODAY=$(date +%Y-%m-%d)
-# Calendar week: Monday to Sunday. Drives the Daily Activity strip (its labels
-# are Mo..Su) and is the fallback week for the totals when the API never
-# answered, so there is no rate limit window to align to.
+# Calendar week: Monday to Sunday. The fallback week for every "week" total, and
+# for the Daily Activity strip, when the API never answered and there is no rate
+# limit window to align to.
 DOW=$(date +%u)  # 1=Monday, 7=Sunday
 WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
 # Calendar month: 1st of current month
@@ -65,6 +65,7 @@ WEEK_SESSIONS=0
 MONTH_TOKENS=0
 WEEK_MODELS=""
 DAILY="0,0,0,0,0,0,0"
+TODAY_TOKENS=0
 
 TODAY_COST="0.00"
 WEEK_COST="0.00"
@@ -159,18 +160,23 @@ fi
 #
 # `week_start` is the first day of the window the week totals cover - the rate
 # limit week when the API told us where it starts, the calendar week otherwise.
-# The Daily Activity strip is always the calendar week, because its labels are
-# fixed weekdays, so the two are computed separately on purpose.
+# The Daily Activity strip covers the same seven days, so its bars add up to the
+# week total printed above them, and its labels are derived from this date rather
+# than fixed, because the window can start on any weekday. The one exception is
+# the morning of a reset day: the window's seventh day is yesterday, while the
+# hours since midnight still count toward the window that is about to close, so
+# today rides along in the totals without a bar. TODAY_TOKENS is counted by date
+# for exactly that reason.
 count_profile_tokens() {
     local proj_dir="$1"
     local out_file="$2"
     local week_start="${3:-$WEEK_START}"
 
-    # Day dates for the calendar week (same logic as outer scope)
+    # The seven days of that window, in order, for the Daily Activity strip
     local day_dates=""
     for i in $(seq 0 6); do
         local d
-        d=$(date -d "$WEEK_START + ${i} days" +%Y-%m-%d)
+        d=$(date -d "$week_start + ${i} days" +%Y-%m-%d)
         day_dates="${day_dates:+${day_dates},}${d}"
     done
 
@@ -242,6 +248,10 @@ count_profile_tokens() {
             n = 0; for (s in week_sess) n++
             printf "WEEK_SESSIONS=%d\n", n
             printf "MONTH_TOKENS=%d\n", month_tokens + 0
+            # Today never depends on where it lands in the strip: during the few
+            # hours between midnight and a reset later the same day, today is not
+            # one of the seven window days at all.
+            printf "TODAY_TOKENS=%d\n", (today in day) ? day[today] : 0
 
             daily = ""
             for (i = 1; i <= 7; i++) {
@@ -729,13 +739,14 @@ for pid in "${PIDS[@]}"; do
 done
 
 # --- Read per-profile results and build aggregate + per-profile output vars ---
-WEEK_TOKENS=0; WEEK_MESSAGES=0; WEEK_SESSIONS=0; MONTH_TOKENS=0
+WEEK_TOKENS=0; WEEK_MESSAGES=0; WEEK_SESSIONS=0; MONTH_TOKENS=0; TODAY_TOKENS=0
 DAILY_ARR=(0 0 0 0 0 0 0)
 DAILY_COSTS_ARR=(0.00 0.00 0.00 0.00 0.00 0.00 0.00)
 TODAY_COST="0.00"; WEEK_COST="0.00"; MONTH_COST="0.00"
 
 PROF_WEEK_TOKENS_LIST=""
 PROF_MONTH_TOKENS_LIST=""
+PROF_TODAY_TOKENS_LIST=""
 PROF_WEEK_MESSAGES_LIST=""
 PROF_WEEK_SESSIONS_LIST=""
 PROF_TODAY_COST_LIST=""
@@ -767,6 +778,7 @@ for idx in "${!TMPFILES[@]}"; do
     p_wm=$(grep "^WEEK_MESSAGES=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_ws=$(grep "^WEEK_SESSIONS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_mt=$(grep "^MONTH_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    p_tt=$(grep "^TODAY_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_daily=$(grep "^DAILY=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0,0,0,0,0,0,0")
     p_models=$(grep "^WEEK_MODELS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "")
     p_wws=$(grep "^WEEK_WINDOW_START=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "$WEEK_START")
@@ -812,6 +824,7 @@ for idx in "${!TMPFILES[@]}"; do
     WEEK_TOKENS=$(( WEEK_TOKENS + p_wt ))
     WEEK_MESSAGES=$(( WEEK_MESSAGES + p_wm ))
     MONTH_TOKENS=$(( MONTH_TOKENS + p_mt ))
+    TODAY_TOKENS=$(( TODAY_TOKENS + p_tt ))
     WEEK_SESSIONS=$(( WEEK_SESSIONS + p_ws ))
 
     # Aggregate daily arrays (element-wise addition via awk)
@@ -836,6 +849,7 @@ for idx in "${!TMPFILES[@]}"; do
     # Per-profile token lists
     PROF_WEEK_TOKENS_LIST="${PROF_WEEK_TOKENS_LIST:+${PROF_WEEK_TOKENS_LIST},}${pname}:${p_wt}"
     PROF_MONTH_TOKENS_LIST="${PROF_MONTH_TOKENS_LIST:+${PROF_MONTH_TOKENS_LIST},}${pname}:${p_mt}"
+    PROF_TODAY_TOKENS_LIST="${PROF_TODAY_TOKENS_LIST:+${PROF_TODAY_TOKENS_LIST},}${pname}:${p_tt}"
     PROF_WEEK_MESSAGES_LIST="${PROF_WEEK_MESSAGES_LIST:+${PROF_WEEK_MESSAGES_LIST},}${pname}:${p_wm}"
     PROF_WEEK_SESSIONS_LIST="${PROF_WEEK_SESSIONS_LIST:+${PROF_WEEK_SESSIONS_LIST},}${pname}:${p_ws}"
     PROF_TODAY_COST_LIST="${PROF_TODAY_COST_LIST:+${PROF_TODAY_COST_LIST},}${pname}:${p_tc}"
@@ -899,6 +913,7 @@ echo "ALLTIME_MESSAGES=${ALLTIME_MESSAGES}"
 echo "FIRST_SESSION=${FIRST_SESSION}"
 echo "DAILY=${DAILY}"
 echo "MONTH_TOKENS=${MONTH_TOKENS}"
+echo "TODAY_TOKENS=${TODAY_TOKENS}"
 echo "TODAY_COST=${TODAY_COST}"
 echo "WEEK_COST=${WEEK_COST}"
 echo "MONTH_COST=${MONTH_COST}"
@@ -909,6 +924,7 @@ echo "PROFILE_SUBSCRIPTION=${PROF_SUBSCRIPTION_LIST}"
 echo "PROFILE_TIER=${PROF_TIER_LIST}"
 echo "PROFILE_WEEK_TOKENS=${PROF_WEEK_TOKENS_LIST}"
 echo "PROFILE_MONTH_TOKENS=${PROF_MONTH_TOKENS_LIST}"
+echo "PROFILE_TODAY_TOKENS=${PROF_TODAY_TOKENS_LIST}"
 echo "PROFILE_WEEK_MESSAGES=${PROF_WEEK_MESSAGES_LIST}"
 echo "PROFILE_WEEK_SESSIONS=${PROF_WEEK_SESSIONS_LIST}"
 echo "PROFILE_TODAY_COST=${PROF_TODAY_COST_LIST}"

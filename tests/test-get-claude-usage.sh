@@ -1132,12 +1132,19 @@ assert_eq "$(usage_field "$OUT32" WEEK_SESSIONS)" "2" \
     "sessions follow the same window"
 assert_eq "$(usage_field "$OUT32" WEEK_MESSAGES)" "2" \
     "messages follow the same window"
-# The strip below the rings is labelled Mo..Su, so it stays on calendar dates
-# even though the totals above it do not.
-TODAY_IDX32=$(( $(date +%u) - 1 ))
+# The strip covers the same seven days as the totals above it, so a bar's
+# position is an offset from the window start, not a weekday.
 DAILY32=$(usage_field "$OUT32" DAILY)
-assert_eq "$(echo "$DAILY32" | cut -d, -f$(( TODAY_IDX32 + 1 )))" "4000" \
-    "the daily strip still buckets by calendar day"
+assert_eq "$(echo "$DAILY32" | cut -d, -f1)" "2000" \
+    "the strip starts on the window's first day"
+assert_eq "$(echo "$DAILY32" | cut -d, -f6)" "4000" \
+    "today sits five days into a window that opened five days ago"
+assert_eq "$(echo "$DAILY32" | awk -F, '{ s = 0; for (i = 1; i <= NF; i++) s += $i; print s }')" "6000" \
+    "the bars add up to the week total"
+assert_eq "$(usage_field "$OUT32" TODAY_TOKENS)" "4000" \
+    "today is reported on its own, not read out of the strip"
+assert_eq "$(echo "$DAILY32" | cut -d, -f7)" "0" \
+    "the day after tomorrow is empty, not the day before the window"
 assert_eq "$(usage_field "$OUT32" WEEKLY_SCOPED)" "Fable 1Mx:6" \
     "a scoped weekly limit is reported per model, delimiters stripped"
 
@@ -1159,6 +1166,48 @@ OUT32C=$(run_script "$ENV32C")
 unset MOCK_CURL_CODE MOCK_CURL_BODY
 assert_eq "$(usage_field "$OUT32C" WEEKLY_SCOPED)" "" \
     "a scoped row without a model name is dropped"
+
+# ============================================================
+echo ""
+echo "=== Test 33: on a reset day today rides along outside the strip ==="
+# ============================================================
+# When the reset lands later today the window's seven days end yesterday, but
+# the hours since midnight still count toward the window that is closing. The
+# strip has no column for today, so TODAY_TOKENS has to be counted by date -
+# reading the last bar would report yesterday's usage as today's.
+ENV33=$(setup_env "test33")
+write_creds "$ENV33" "$FUTURE_MS"
+
+# Local noon today, expressed in UTC: the date of the boundary is today whatever
+# the current hour is, so the window always starts seven days back.
+RESET33=$(date -u -d "today 12:00" +%Y-%m-%dT%H:%M:%S+00:00)
+WINDOW33=$(date -d "-7 days" +%Y-%m-%d)
+YESTERDAY33=$(date -d "-1 day" +%Y-%m-%d)
+
+{
+    make_jsonl_line "$WINDOW33" "claude-opus-4" 1000 0 0 0 "sess-first"
+    make_jsonl_line "$YESTERDAY33" "claude-opus-4" 2000 0 0 0 "sess-last"
+    make_jsonl_line "$TODAY" "claude-opus-4" 500 0 0 0 "sess-today"
+} > "$ENV33/.claude/projects/test-project/test.jsonl"
+
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":80,\"resets_at\":\"$RESET33\"},\"extra_usage\":{\"is_enabled\":false}}"
+OUT33=$(run_script "$ENV33")
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+assert_eq "$(usage_field "$OUT33" WEEK_WINDOW_START)" "$WINDOW33" \
+    "a reset later today opens the window seven days back"
+DAILY33=$(usage_field "$OUT33" DAILY)
+assert_eq "$(echo "$DAILY33" | cut -d, -f1)" "1000" \
+    "the window's first day is the first bar"
+assert_eq "$(echo "$DAILY33" | cut -d, -f7)" "2000" \
+    "yesterday is the last bar, today has none"
+assert_eq "$(usage_field "$OUT33" TODAY_TOKENS)" "500" \
+    "today is still counted, from its date"
+assert_eq "$(usage_field "$OUT33" WEEK_TOKENS)" "3500" \
+    "the closing window keeps today's hours in its total"
+assert_eq "$(usage_field "$OUT33" PROFILE_TODAY_TOKENS)" "default:500" \
+    "today is reported per profile too"
 # ============================================================
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -186,6 +186,29 @@ function parseScopedLimits(val) {
     }
     return out
 }
+
+// Monday-first labels rotated so index 0 is the weekday the window starts on.
+function rotateWeekdays(base, windowStart) {
+    var d = new Date(windowStart + "T00:00:00")
+    if (isNaN(d.getTime())) return base
+    var startDow = (d.getDay() + 6) % 7
+    var out = []
+    for (var i = 0; i < 7; i++) out.push(base[(startDow + i) % 7])
+    return out
+}
+
+// Column 0..6 of the strip a date falls in, or -1 outside the window.
+function windowDayIndex(windowStart, when) {
+    var start = new Date(windowStart + "T00:00:00")
+    if (isNaN(start.getTime())) return -1
+    var day = new Date(when.getFullYear(), when.getMonth(), when.getDate())
+    var diff = day.getTime() - start.getTime()
+    var days = Math.round(diff / 86400000)
+    return days >= 0 && days <= 6 ? days : -1
+}
+
+var EN_DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+function localDate(s) { return new Date(s + "T09:00:00") }
 '
 
 # ============================================================
@@ -535,6 +558,34 @@ test_expr "JSON.stringify(parseScopedLimits('Fable:6,broken,Opus:12'))" \
     "one broken row does not lose the good ones"
 test_expr "JSON.stringify(parseScopedLimits('Fable:0'))" \
     '[{"name":"Fable","percent":0}]' "an unused model at 0% is still reported"
+
+# ============================================================
+echo "=== Test 10: the strip follows the rate limit window ==="
+# ============================================================
+
+# 2026-08-06 is a Thursday - the day claude.ai resets this account.
+test_expr "rotateWeekdays(EN_DAYS, '2026-08-06').join(' ')" \
+    "Th Fr Sa Su Mo Tu We" "labels start on the window's weekday"
+test_expr "rotateWeekdays(EN_DAYS, '2026-08-10').join(' ')" \
+    "Mo Tu We Th Fr Sa Su" "a Monday window still reads Mo..Su"
+test_expr "rotateWeekdays(EN_DAYS, '2026-08-09').join(' ')" \
+    "Su Mo Tu We Th Fr Sa" "a Sunday window wraps around the end of the row"
+test_expr "rotateWeekdays(EN_DAYS, '').join(' ')" \
+    "Mo Tu We Th Fr Sa Su" "no window date leaves the row Monday-first"
+
+test_expr "windowDayIndex('2026-08-06', localDate('2026-08-06'))" "0" \
+    "the window's first day is column 0"
+test_expr "windowDayIndex('2026-08-06', localDate('2026-08-10'))" "4" \
+    "a day inside the window is its offset from the start"
+test_expr "windowDayIndex('2026-08-06', localDate('2026-08-12'))" "6" \
+    "the window's last day is column 6"
+# The reset-day morning: the window on screen ends yesterday, so today has no bar.
+test_expr "windowDayIndex('2026-08-06', localDate('2026-08-13'))" "-1" \
+    "the day after the window has no column"
+test_expr "windowDayIndex('2026-08-06', localDate('2026-08-05'))" "-1" \
+    "the day before the window has no column"
+test_expr "windowDayIndex('', localDate('2026-08-10'))" "-1" \
+    "no window date highlights nothing"
 
 # ============================================================
 echo ""

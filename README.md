@@ -15,7 +15,7 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
   - Per-model weekly limits under the 7-day ring — claude.ai gives some models their own weekly cap, so the all-models ring can sit at 71% while a single model is at 6%
   - Token consumption breakdown (today, the current rate limit week, calendar month). The week totals cover the seven days the 7-day ring measures, which start when the limit last reset, not Monday - the card says which day they start from
   - Estimated API cost per period (today, week, calendar month) with automatic pricing from [LiteLLM](https://github.com/BerriAI/litellm)
-  - Weekly activity bar chart (Monday–Sunday) with interactive hover tooltips (token count + cost)
+  - Daily activity bar chart covering the same seven days as the 7-day ring, so the bars add up to the week total above them. It starts on the day the limit last reset, so the weekday labels rotate with the window and each tooltip names its date (token count + cost)
   - Per-model token usage for the current rate limit week with dynamic model family detection
   - All-time session and message statistics
 - **Profile breakdown** — per-profile token/cost stats with a hybrid profile selector (tabs for up to 4 profiles, dropdown for more). Profiles are discovered automatically from:
