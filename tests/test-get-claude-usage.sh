@@ -30,16 +30,64 @@ setup_env() {
 # Mock curl: avoids real network calls. Mirrors `curl -w '\n%{http_code}'` — body
 # first, then the status on its own line. Tests drive it with MOCK_CURL_BODY and
 # MOCK_CURL_CODE; unset means "empty JSON, no status line", i.e. an unreachable API.
+#
+# The OAuth token endpoint gets its own fixture pair (MOCK_TOKEN_BODY /
+# MOCK_TOKEN_CODE) so a test can make the refresh succeed while the usage call
+# fails, and MOCK_CURL_BODY_2 / MOCK_CURL_CODE_2 answer the second usage call so
+# the 401-refresh-retry path can be driven. Every invocation is appended to
+# CALL_LOG, which is how tests see whether a refresh was attempted at all and
+# which token the retry carried.
+CALL_LOG="$TMPDIR_ROOT/curl-calls.log"
 mock_curl="$TMPDIR_ROOT/curl"
-cat > "$mock_curl" << 'CURLEOF'
+cat > "$mock_curl" << CURLEOF
 #!/usr/bin/env bash
-body="${MOCK_CURL_BODY-}"
-[ -n "$body" ] || body='{}'
-printf '%s' "$body"
-[ -n "${MOCK_CURL_CODE-}" ] && printf '\n%s' "$MOCK_CURL_CODE"
+printf '%s\n' "\$*" >> "$CALL_LOG"
+
+kind=other
+for arg in "\$@"; do
+    case "\$arg" in
+        *oauth/token*) kind=token ;;
+        *oauth/usage*) [ "\$kind" = token ] || kind=usage ;;
+    esac
+done
+
+if [ "\$kind" = token ]; then
+    # Simulates Claude Code refreshing the same credentials while our request is
+    # in flight: the file gains tokens we never asked for.
+    if [ -n "\${MOCK_TOKEN_ROTATE-}" ]; then
+        cat > "\$MOCK_TOKEN_ROTATE" << ROTATEEOF
+{"claudeAiOauth":{"accessToken":"other-access","refreshToken":"other-refresh","expiresAt":\$(( (\$(date +%s) + 3600) * 1000 ))}}
+ROTATEEOF
+    fi
+    body="\${MOCK_TOKEN_BODY-}"
+    [ -n "\$body" ] || body='{}'
+    printf '%s' "\$body"
+    [ -n "\${MOCK_TOKEN_CODE-}" ] && printf '\n%s' "\$MOCK_TOKEN_CODE"
+    exit 0
+fi
+
+body="\${MOCK_CURL_BODY-}"
+code="\${MOCK_CURL_CODE-}"
+if [ "\$kind" = usage ]; then
+    count_file="$TMPDIR_ROOT/usage-calls"
+    n=\$(cat "\$count_file" 2>/dev/null || echo 0)
+    n=\$(( n + 1 ))
+    printf '%s' "\$n" > "\$count_file"
+    if [ "\$n" -ge 2 ] && [ -n "\${MOCK_CURL_BODY_2-}\${MOCK_CURL_CODE_2-}" ]; then
+        body="\${MOCK_CURL_BODY_2-}"
+        code="\${MOCK_CURL_CODE_2-}"
+    fi
+fi
+[ -n "\$body" ] || body='{}'
+printf '%s' "\$body"
+[ -n "\$code" ] && printf '\n%s' "\$code"
 exit 0
 CURLEOF
 chmod +x "$mock_curl"
+
+# Usage: calls_matching <regex> — how many mock curl invocations matched
+calls_matching() { grep -cE "$1" "$CALL_LOG" 2>/dev/null || true; }
+reset_calls() { : > "$CALL_LOG"; rm -f "$TMPDIR_ROOT/usage-calls"; }
 
 run_script() {
     local home_dir="$1"
@@ -842,6 +890,175 @@ assert_eq "$(usage_field "$OUT29" FIVE_HOUR_UTIL)" "7" "--force refetches past a
 assert_eq "$(usage_field "$OUT29" PROFILES)" "default" "--force is not registered as a profile"
 unset MOCK_CURL_CODE MOCK_CURL_BODY
 
+# ============================================================
+echo ""
+echo "=== Test 30: expired access token is refreshed in place ==="
+# ============================================================
+# The widget outlives the ~12h access token. Before this, a dead token meant every
+# fetch was refused until Claude Code itself ran; now the script does the
+# `refresh_token` grant. These assertions guard the credentials file, which is the
+# expensive thing to get wrong: a bad write breaks the user's login.
+ENV30=$(setup_env "test30")
+CREDS30="$ENV30/.claude/.credentials.json"
+STAMP30="$ENV30/.claude/usage-cache-refresh.stamp"
+USAGE_OK30='{"five_hour":{"utilization":9,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":3,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+
+write_refreshable_creds() {
+    # Usage: write_refreshable_creds <expiresAt_ms> <refreshToken> [refreshTokenExpiresAt_ms]
+    # `mcpOAuth` is a key this script knows nothing about - it must survive.
+    local rexp="${3-}"
+    cat > "$CREDS30" << CRED30EOF
+{
+    "claudeAiOauth": {
+        "subscriptionType": "team",
+        "rateLimitTier": "default_claude_max_5x",
+        "accessToken": "old-access",
+        "refreshToken": "$2",
+        "expiresAt": $1,
+        ${rexp:+\"refreshTokenExpiresAt\": $rexp,}
+        "scopes": ["user:profile", "user:inference"]
+    },
+    "mcpOAuth": {"some-server": {"accessToken": "keep-me"}}
+}
+CRED30EOF
+    chmod 600 "$CREDS30"
+}
+
+creds_field() { jq -r "$1" "$CREDS30" 2>/dev/null; }
+# Each sub-case below wants a real fetch, and the previous one leaves a fresh
+# usage cache behind - which would serve numbers and skip the refresh entirely.
+reset30() { reset_calls; rm -f "$ENV30/.claude/usage-cache.json"; }
+
+# --- Expired token, refresh works: numbers go live and the file is updated ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","refresh_token":"new-refresh","expires_in":43200,"refresh_token_expires_in":2592000,"scope":"user:profile user:inference user:mcp_servers"}'
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="$USAGE_OK30"
+OUT30A=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30A" USAGE_ERROR)" "" "refreshed token → no warning"
+assert_eq "$(usage_field "$OUT30A" USAGE_AGE)" "0" "refreshed token → live numbers"
+assert_eq "$(usage_field "$OUT30A" FIVE_HOUR_UTIL)" "9" "refreshed token → real utilization"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "new-access" "new access token stored"
+assert_eq "$(creds_field '.claudeAiOauth.refreshToken')" "new-refresh" "rotated refresh token stored"
+assert_eq "$(creds_field '.mcpOAuth."some-server".accessToken')" "keep-me" "unrelated credentials keys survive"
+assert_eq "$(creds_field '.claudeAiOauth.subscriptionType')" "team" "subscription details survive"
+assert_eq "$(creds_field '.claudeAiOauth.scopes | join(",")')" "user:profile,user:inference,user:mcp_servers" \
+    "granted scopes replace the requested ones"
+assert_eq "$(stat -c '%a' "$CREDS30")" "600" "credentials file keeps mode 600"
+EXP30=$(creds_field '.claudeAiOauth.expiresAt')
+if [ "$EXP30" -gt "$(( NOW28 * 1000 ))" ]; then
+    pass "expiresAt moved into the future"
+else
+    fail "expiresAt not renewed (got $EXP30)"
+fi
+assert_eq "$(calls_matching 'Bearer new-access')" "1" "usage fetch used the refreshed token"
+assert_eq "$(calls_matching 'User-Agent: dms-claudecode.*oauth/token')" "1" "the refresh says who it really is"
+assert_eq "$(calls_matching 'User-Agent: claude-code.*oauth/token')" "0" "the refresh does not impersonate Claude Code"
+if [ -f "$STAMP30" ]; then fail "successful refresh left a backoff stamp"; else pass "successful refresh leaves no backoff stamp"; fi
+
+# --- Refresh refused: credentials untouched, user told to run claude ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=400
+export MOCK_TOKEN_BODY='{"error":"invalid_grant"}'
+export MOCK_CURL_CODE=401
+export MOCK_CURL_BODY='{}'
+OUT30B=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30B" USAGE_ERROR)" "token_expired" "failed refresh → token_expired"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "old-access" "failed refresh does not touch the login"
+assert_eq "$(creds_field '.claudeAiOauth.refreshToken')" "old-refresh" "failed refresh keeps the refresh token"
+if [ -f "$STAMP30" ]; then pass "failed refresh records a backoff stamp"; else fail "no backoff stamp after failure"; fi
+
+# --- Backoff: the next run does not retry a refresh that just failed ---
+reset30
+OUT30C=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "backoff suppresses the immediate retry"
+assert_eq "$(usage_field "$OUT30C" USAGE_ERROR)" "token_expired" "backoff still reports the cause"
+rm -f "$STAMP30"
+
+# --- Throttled refresh: the login is fine, so do not tell the user to log in ---
+# The token endpoint refuses some agent strings with a 429 before it even looks at
+# the grant. That is a wait, not a dead login, and the stamp carries the code so
+# the suppressed retry keeps saying the same thing.
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=429
+export MOCK_TOKEN_BODY='{"error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}'
+OUT30I=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30I" USAGE_ERROR)" "rate_limited" "throttled refresh → rate_limited, not token_expired"
+assert_eq "$(awk 'NR==1 {print $2}' "$STAMP30")" "429" "the stamp records the refresh status code"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "old-access" "throttled refresh does not touch the login"
+reset30
+OUT30J=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "throttled refresh backs off like any other failure"
+assert_eq "$(usage_field "$OUT30J" USAGE_ERROR)" "rate_limited" "backoff keeps reporting the throttle"
+rm -f "$STAMP30"
+
+# --- 200 with a body that is not a token: treated as a failure ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"unexpected":"shape"}'
+OUT30D=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30D" USAGE_ERROR)" "token_expired" "malformed token response → token_expired"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "old-access" "malformed token response does not touch the login"
+rm -f "$STAMP30"
+
+# --- A dead refresh token cannot be refreshed: do not even ask ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$PAST_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","expires_in":43200}'
+OUT30E=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "expired refresh token → no request spent"
+assert_eq "$(usage_field "$OUT30E" USAGE_ERROR)" "token_expired" "expired refresh token → token_expired"
+
+# --- No refresh token at all (old credentials file): no request, same message ---
+write_refreshable_creds "$PAST_MS" "" "$FUTURE_MS"
+reset30
+OUT30F=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "missing refresh token → no request spent"
+assert_eq "$(usage_field "$OUT30F" USAGE_ERROR)" "token_expired" "missing refresh token → token_expired"
+rm -f "$STAMP30"
+
+# --- 401 on a token the file still calls valid: refresh, then retry once ---
+write_refreshable_creds "$FUTURE_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","refresh_token":"new-refresh","expires_in":43200}'
+export MOCK_CURL_CODE=401
+export MOCK_CURL_BODY='{}'
+export MOCK_CURL_CODE_2=200
+export MOCK_CURL_BODY_2="$USAGE_OK30"
+OUT30G=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30G" USAGE_ERROR)" "" "401 on a live token → refresh and retry recovers"
+assert_eq "$(usage_field "$OUT30G" FIVE_HOUR_UTIL)" "9" "retry after refresh returns real numbers"
+assert_eq "$(calls_matching 'oauth/token')" "1" "the retry refreshes exactly once"
+assert_eq "$(calls_matching 'Bearer new-access')" "1" "the retry carries the new token"
+unset MOCK_CURL_CODE_2 MOCK_CURL_BODY_2
+
+# --- Someone else refreshed mid-flight: use their token, leave the file alone ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_ROTATE="$CREDS30"
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","refresh_token":"new-refresh","expires_in":43200}'
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="$USAGE_OK30"
+OUT30H=$(run_script "$ENV30")
+unset MOCK_TOKEN_ROTATE
+assert_eq "$(creds_field '.claudeAiOauth.refreshToken')" "other-refresh" \
+    "a concurrent refresh is not overwritten"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "other-access" \
+    "the concurrent writer's access token is kept"
+assert_eq "$(calls_matching 'Bearer other-access')" "1" "the fetch uses the concurrent writer's token"
+assert_eq "$(usage_field "$OUT30H" USAGE_ERROR)" "" "concurrent refresh still yields live numbers"
+unset MOCK_TOKEN_CODE MOCK_TOKEN_BODY MOCK_CURL_CODE MOCK_CURL_BODY
+
+# ============================================================
+echo ""
 echo "=== Test 31: decorated model ids fold into their family ==="
 # ============================================================
 # Claude Code reports whatever id the backend uses: Bedrock adds a region and a

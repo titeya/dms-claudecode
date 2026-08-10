@@ -289,8 +289,9 @@ PluginComponent {
     function usageErrorLabel(code) {
         switch (code) {
         case "token_expired":
-            // Names the fix, not just the fault: the plugin cannot refresh the
-            // token, only Claude Code itself can, by being run once.
+            // The script renews the access token itself, so this only appears
+            // when the refresh token is dead too - and then a `claude` run is
+            // genuinely the only fix. Names it instead of just the fault.
             return tr("Claude Code login expired - run claude once");
         case "rate_limited":
             return tr("API rate limited");

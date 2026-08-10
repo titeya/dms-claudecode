@@ -248,19 +248,168 @@ count_profile_tokens() {
         }' > "$out_file" 2>/dev/null || true
 }
 
+# --- OAuth token refresh ---
+# The access token in `.credentials.json` lives ~12h. Claude Code renews it when
+# it runs, so a user whose daily driver is Claude Code never notices. For everyone
+# else the token dies and every usage fetch from here on is refused, which froze
+# this widget on hours-old numbers. So do the refresh ourselves: the endpoint,
+# client id and body below are exactly what Claude Code 2.1.x sends (`TOKEN_URL`,
+# `CLIENT_ID` and its `grant_type=refresh_token` call in its own bundle).
+OAUTH_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_SCOPES="user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+# Not `claude-code/<version>`: that exact string is throttled at the edge of the
+# token endpoint (measured: HTTP 429 in 20ms before the grant is even looked at,
+# while any other agent string gets a real answer). We are not Claude Code, so we
+# say who we are.
+OAUTH_USER_AGENT="dms-claudecode"
+# How long a failed refresh is left alone. The widget fetches every 2 minutes, so
+# without this a permanently dead refresh token would hammer the endpoint forever.
+REFRESH_BACKOFF=600  # seconds
+
+# Usage: refresh_oauth_token <credentials_file> <backoff_stamp_file>
+# Echoes a usable access token and returns 0, or returns 1 and prints nothing.
+# A failure leaves `<epoch> <http_code>` in the stamp file: the epoch gates the
+# retry, the code lets the caller say "rate limited" instead of "log in again".
+#
+# This is the one place the plugin writes a file it does not own, so it is
+# deliberately timid: the credentials file is replaced only when the response
+# parsed completely AND nobody rotated the refresh token while the request was in
+# flight. A half-written credentials file breaks the user's Claude Code login,
+# which is far worse than a widget showing stale numbers.
+refresh_oauth_token() {
+    local creds_file="$1" stamp_file="$2"
+    local now_ts refresh_token refresh_exp stamp scopes raw http_code body
+    local access_token new_refresh expires_in refresh_expires_in
+    local expires_ms refresh_expires_ms current_refresh other_token tmp_file
+
+    now_ts=$(date +%s)
+
+    refresh_token=$(jq -r '.claudeAiOauth.refreshToken // ""' "$creds_file" 2>/dev/null | head -1)
+    [ -n "$refresh_token" ] || return 1
+
+    # An expired refresh token can only be replaced by `claude auth login`, and
+    # spending a request to be told that helps nobody.
+    refresh_exp=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // 0' "$creds_file" 2>/dev/null | head -1)
+    [[ "$refresh_exp" =~ ^[0-9]+$ ]] || refresh_exp=0
+    if [ "$refresh_exp" -gt 0 ] && [ $(( refresh_exp / 1000 )) -le "$now_ts" ]; then
+        return 1
+    fi
+
+    if [ -f "$stamp_file" ]; then
+        stamp=$(awk 'NR==1 {print $1}' "$stamp_file" 2>/dev/null || echo 0)
+        [[ "$stamp" =~ ^[0-9]+$ ]] || stamp=0
+        if [ $(( now_ts - stamp )) -lt "$REFRESH_BACKOFF" ]; then
+            return 1
+        fi
+    fi
+
+    # Ask for the scopes the login already has; the hardcoded list is only a
+    # fallback for a credentials file written before scopes were stored.
+    scopes=$(jq -r '(.claudeAiOauth.scopes // []) | join(" ")' "$creds_file" 2>/dev/null | head -1)
+    [ -n "$scopes" ] || scopes="$OAUTH_SCOPES"
+
+    raw=$(curl -s -w '\n%{http_code}' --max-time 15 -X POST \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -H "User-Agent: ${OAUTH_USER_AGENT}" \
+        -d "$(jq -nc --arg rt "$refresh_token" --arg cid "$OAUTH_CLIENT_ID" --arg scope "$scopes" \
+                '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid, scope: $scope}')" \
+        "$OAUTH_TOKEN_URL" 2>/dev/null) || raw=""
+
+    http_code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=000
+
+    access_token=""; new_refresh=""; expires_in=0; refresh_expires_in=0
+    if [ "$http_code" = 200 ]; then
+        access_token=$(echo "$body" | jq -r '.access_token // ""' 2>/dev/null | head -1)
+        new_refresh=$(echo "$body" | jq -r '.refresh_token // ""' 2>/dev/null | head -1)
+        expires_in=$(echo "$body" | jq -r '.expires_in // 0' 2>/dev/null | head -1)
+        refresh_expires_in=$(echo "$body" | jq -r '.refresh_token_expires_in // 0' 2>/dev/null | head -1)
+    fi
+    [[ "$expires_in" =~ ^[0-9]+$ ]] || expires_in=0
+    [[ "$refresh_expires_in" =~ ^[0-9]+$ ]] || refresh_expires_in=0
+
+    if [ -z "$access_token" ] || [ "$expires_in" -le 0 ]; then
+        printf '%s %s\n' "$now_ts" "$http_code" > "$stamp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # The server rotates the refresh token on use, so an omitted one means "keep
+    # the old one", not "drop it".
+    [ -n "$new_refresh" ] || new_refresh="$refresh_token"
+    expires_ms=$(( (now_ts + expires_in) * 1000 ))
+    refresh_expires_ms=0
+    [ "$refresh_expires_in" -gt 0 ] && refresh_expires_ms=$(( (now_ts + refresh_expires_in) * 1000 ))
+
+    # Claude Code, or a parallel run of this script, may have refreshed while our
+    # request was in flight. Their token is as good as ours and the server has
+    # already retired the one we sent, so take theirs and leave the file alone.
+    current_refresh=$(jq -r '.claudeAiOauth.refreshToken // ""' "$creds_file" 2>/dev/null | head -1)
+    if [ "$current_refresh" != "$refresh_token" ]; then
+        other_token=$(jq -r '.claudeAiOauth.accessToken // ""' "$creds_file" 2>/dev/null | head -1)
+        [ -n "$other_token" ] || return 1
+        rm -f "$stamp_file" 2>/dev/null || true
+        printf '%s\n' "$other_token"
+        return 0
+    fi
+
+    # Merge, never rewrite: the file carries keys this script does not know about
+    # (`mcpOAuth`, subscription details) and losing them would break the login.
+    # `umask 077` keeps the 0600 mode across the rename.
+    tmp_file="${creds_file}.$$.tmp"
+    if ! ( umask 077; jq --arg at "$access_token" --arg rt "$new_refresh" \
+            --argjson exp "$expires_ms" --argjson rexp "$refresh_expires_ms" \
+            --arg scope "$(echo "$body" | jq -r '.scope // ""' 2>/dev/null | head -1)" '
+            .claudeAiOauth.accessToken = $at
+            | .claudeAiOauth.refreshToken = $rt
+            | .claudeAiOauth.expiresAt = $exp
+            | if $rexp > 0 then .claudeAiOauth.refreshTokenExpiresAt = $rexp else . end
+            | if ($scope | length) > 0 then .claudeAiOauth.scopes = ($scope | split(" ")) else . end
+        ' "$creds_file" > "$tmp_file" 2>/dev/null ); then
+        rm -f "$tmp_file"
+        printf '%s %s\n' "$now_ts" "$http_code" > "$stamp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # Verify the merge landed before overwriting a working login: a truncated or
+    # empty temp file would otherwise become the user's credentials.
+    if ! jq -e --arg at "$access_token" '.claudeAiOauth.accessToken == $at' "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        printf '%s %s\n' "$now_ts" "$http_code" > "$stamp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    mv -f "$tmp_file" "$creds_file" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
+    rm -f "$stamp_file" 2>/dev/null || true
+    printf '%s\n' "$access_token"
+}
+
 # Why did the usage fetch fail? Short stable tokens, the widget maps them to text.
-# Usage: classify_usage_error <credentials_file> <now_epoch> <http_code>
-# An expired OAuth token wins over the HTTP code: the widget only reads
-# `.credentials.json`, it never refreshes it, so a stale login keeps failing until
-# Claude Code runs again - that is the actionable cause, whatever the API answered.
+# Usage: classify_usage_error <credentials_file> <now_epoch> <http_code> [refresh_stamp]
+# An expired OAuth token wins over the HTTP code: it is the cause the user can act
+# on. The script refreshes the token itself (see `refresh_oauth_token`), so seeing
+# this reason means even the refresh could not save it - the refresh token is gone
+# too, and only `claude` running once will fix the login. Unless the refresh was
+# throttled rather than refused: then the login is fine and the advice would be
+# wrong, so the stamp's HTTP code overrides it.
 classify_usage_error() {
-    local creds_file="$1" now_ts="$2" http_code="$3"
-    local expires_ms
+    local creds_file="$1" now_ts="$2" http_code="$3" refresh_stamp="${4:-}"
+    local expires_ms refresh_code
 
     expires_ms=$(jq -r '.claudeAiOauth.expiresAt // 0' "$creds_file" 2>/dev/null | head -1)
     [[ "$expires_ms" =~ ^[0-9]+$ ]] || expires_ms=0
     if [ "$expires_ms" -gt 0 ] && [ $(( expires_ms / 1000 )) -le "$now_ts" ]; then
-        echo "token_expired"
+        refresh_code=""
+        if [ -n "$refresh_stamp" ] && [ -f "$refresh_stamp" ]; then
+            refresh_code=$(awk 'NR==1 {print $2}' "$refresh_stamp" 2>/dev/null || echo "")
+        fi
+        if [ "$refresh_code" = 429 ]; then
+            echo "rate_limited"
+        else
+            echo "token_expired"
+        fi
         return
     fi
 
@@ -332,29 +481,62 @@ fetch_profile_usage() {
     if [ "$use_cache" = true ]; then
         api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
     else
-        local token
+        local token expires_ms refreshed=false new_token
+        local refresh_stamp="${cache_file%.json}-refresh.stamp"
         token=$(jq -r '.claudeAiOauth.accessToken // ""' "$creds_file" 2>/dev/null || echo "")
+        expires_ms=$(jq -r '.claudeAiOauth.expiresAt // 0' "$creds_file" 2>/dev/null | head -1)
+        [[ "$expires_ms" =~ ^[0-9]+$ ]] || expires_ms=0
+
+        # Renew before spending the request: a token that is already dead - or dies
+        # within the minute - cannot serve this fetch anyway. `refreshed` is set
+        # even when the attempt fails, so the 401 path below never doubles up.
+        if [ -n "$token" ] && [ "$expires_ms" -gt 0 ] && [ $(( expires_ms / 1000 )) -le $(( now_ts + 60 )) ]; then
+            if new_token=$(refresh_oauth_token "$creds_file" "$refresh_stamp"); then
+                token="$new_token"
+            fi
+            refreshed=true
+        fi
+
         if [ -z "$token" ]; then
             usage_error="no_credentials"
         else
-            # `-w` appends the status on its own line, so the body is everything
-            # before it. Needed to tell "rate limited" from "offline" from a
-            # dead token - all three otherwise look like an empty response.
             local http_code=000
             local raw=""
-            raw=$(curl -s -w '\n%{http_code}' --max-time 5 \
-                -H "Authorization: Bearer $token" \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -H "User-Agent: claude-code/${CLAUDE_VERSION}" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || raw=""
-            if [ -n "$raw" ]; then
-                http_code="${raw##*$'\n'}"
-                api_resp="${raw%$'\n'*}"
-                [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=000
-                [ -n "$api_resp" ] || api_resp="{}"
-            fi
+            local attempt
+            for attempt in 1 2; do
+                http_code=000
+                raw=""
+                api_resp="{}"
+                # `-w` appends the status on its own line, so the body is everything
+                # before it. Needed to tell "rate limited" from "offline" from a
+                # dead token - all three otherwise look like an empty response.
+                raw=$(curl -s -w '\n%{http_code}' --max-time 5 \
+                    -H "Authorization: Bearer $token" \
+                    -H "Accept: application/json" \
+                    -H "Content-Type: application/json" \
+                    -H "User-Agent: claude-code/${CLAUDE_VERSION}" \
+                    -H "anthropic-beta: oauth-2025-04-20" \
+                    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || raw=""
+                if [ -n "$raw" ]; then
+                    http_code="${raw##*$'\n'}"
+                    api_resp="${raw%$'\n'*}"
+                    [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=000
+                    [ -n "$api_resp" ] || api_resp="{}"
+                fi
+
+                # A 401 on a token the file still calls valid means the server
+                # retired it early. One refresh, one retry, never a loop.
+                if [ "$http_code" = 401 ] && [ "$refreshed" = false ]; then
+                    refreshed=true
+                    if new_token=$(refresh_oauth_token "$creds_file" "$refresh_stamp"); then
+                        if [ "$new_token" != "$token" ]; then
+                            token="$new_token"
+                            continue
+                        fi
+                    fi
+                fi
+                break
+            done
 
             if echo "$api_resp" | jq -e '.five_hour' >/dev/null 2>&1; then
                 # Write atomically: overlapping widget refreshes both target the
@@ -368,7 +550,7 @@ fetch_profile_usage() {
                     rm -f "$cache_tmp"
                 fi
             else
-                usage_error=$(classify_usage_error "$creds_file" "$now_ts" "$http_code")
+                usage_error=$(classify_usage_error "$creds_file" "$now_ts" "$http_code" "$refresh_stamp")
                 if [ "$cache_matches" = true ]; then
                     api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
                     usage_age="$cache_age"
