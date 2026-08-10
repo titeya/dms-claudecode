@@ -169,6 +169,23 @@ function usageWarning(age, err) {
     if (age <= 0) return reason
     return formatAge(age) + " " + tr("old") + " \u00b7 " + reason
 }
+
+// "Fable:6,Opus:12" -> [{ name: "Fable", percent: 6 }, ...]. The script strips
+// `,` `:` `|` from model names, so splitting on them here is safe.
+function parseScopedLimits(val) {
+    var out = []
+    if (!val) return out
+    var entries = val.split(",")
+    for (var i = 0; i < entries.length; i++) {
+        var colon = entries[i].lastIndexOf(":")
+        if (colon <= 0) continue
+        var name = entries[i].substring(0, colon)
+        var pct = parseFloat(entries[i].substring(colon + 1))
+        if (name === "" || isNaN(pct)) continue
+        out.push({ name: name, percent: pct })
+    }
+    return out
+}
 '
 
 # ============================================================
@@ -491,6 +508,33 @@ test_expr "usageWarning(120, 'offline')" \
     "2m old · No connection" "usageWarning offline"
 test_expr "usageWarning(60, 'http_500')" \
     "1m old · http_500" "usageWarning passes unknown codes through"
+
+# ============================================================
+echo "=== Test 9: parseScopedLimits ==="
+# ============================================================
+
+test_expr "JSON.stringify(parseScopedLimits(''))" "[]" \
+    "no scoped limits when the field is empty"
+test_expr "JSON.stringify(parseScopedLimits('Fable:6'))" \
+    '[{"name":"Fable","percent":6}]' "one model with its own weekly cap"
+test_expr "JSON.stringify(parseScopedLimits('Fable:6,Opus:12.5'))" \
+    '[{"name":"Fable","percent":6},{"name":"Opus","percent":12.5}]' \
+    "several models keep their order and fractional percents"
+# The script strips delimiters from names, but a display name can still carry a
+# space; only the last colon separates the percent.
+test_expr "JSON.stringify(parseScopedLimits('Claude Opus 4.5:71'))" \
+    '[{"name":"Claude Opus 4.5","percent":71}]' "a spaced model name survives intact"
+test_expr "JSON.stringify(parseScopedLimits(':50'))" "[]" \
+    "a nameless row is dropped"
+test_expr "JSON.stringify(parseScopedLimits('Fable:'))" "[]" \
+    "a row without a percent is dropped"
+test_expr "JSON.stringify(parseScopedLimits('Fable'))" "[]" \
+    "a row without a separator is dropped"
+test_expr "JSON.stringify(parseScopedLimits('Fable:6,broken,Opus:12'))" \
+    '[{"name":"Fable","percent":6},{"name":"Opus","percent":12}]' \
+    "one broken row does not lose the good ones"
+test_expr "JSON.stringify(parseScopedLimits('Fable:0'))" \
+    '[{"name":"Fable","percent":0}]' "an unused model at 0% is still reported"
 
 # ============================================================
 echo ""

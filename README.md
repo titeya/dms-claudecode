@@ -12,10 +12,11 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
   - Stale-data warning when the usage API cannot be reached — the pill dims and adds `?`, and the popout says how old the numbers are and what to do about it (e.g. `3h 40m old · Claude Code login expired - run claude once`), instead of presenting cached numbers as live
   - Refresh button in the popout header for an immediate fetch that ignores the cache — after fixing an expired login you see the real numbers straight away instead of waiting out the refresh interval
   - Pacing indicator showing whether you're over or under a linear burn rate for each window (e.g. "6% over pace", "25% under pace")
-  - Token consumption breakdown (today, calendar week, calendar month)
-  - Estimated API cost per period (today, calendar week, calendar month) with automatic pricing from [LiteLLM](https://github.com/BerriAI/litellm)
+  - Per-model weekly limits under the 7-day ring — claude.ai gives some models their own weekly cap, so the all-models ring can sit at 71% while a single model is at 6%
+  - Token consumption breakdown (today, the current rate limit week, calendar month). The week totals cover the seven days the 7-day ring measures, which start when the limit last reset, not Monday - the card says which day they start from
+  - Estimated API cost per period (today, week, calendar month) with automatic pricing from [LiteLLM](https://github.com/BerriAI/litellm)
   - Weekly activity bar chart (Monday–Sunday) with interactive hover tooltips (token count + cost)
-  - Per-model token usage for the current calendar week with dynamic model family detection
+  - Per-model token usage for the current rate limit week with dynamic model family detection
   - All-time session and message statistics
 - **Profile breakdown** — per-profile token/cost stats with a hybrid profile selector (tabs for up to 4 profiles, dropdown for more). Profiles are discovered automatically from:
   - `~/.claude` (the `default` profile)
