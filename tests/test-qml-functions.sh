@@ -171,7 +171,7 @@ function usageWarning(age, err) {
 }
 
 // "Fable:6,Opus:12" -> [{ name: "Fable", percent: 6 }, ...]. The script strips
-// `,` `:` `|` from model names, so splitting on them here is safe.
+// "," ":" and "|" out of model names, so splitting on them here is safe.
 function parseScopedLimits(val) {
     var out = []
     if (!val) return out
