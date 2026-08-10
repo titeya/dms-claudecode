@@ -105,12 +105,12 @@ make_jsonl_line() {
 }
 
 # ============================================================
-echo "=== Test 1: Output format — all 23 keys present ==="
+echo "=== Test 1: Output format — all 25 keys present ==="
 # ============================================================
 ENV1=$(setup_env "test1")
 OUTPUT1=$(run_script "$ENV1")
 
-EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED USAGE_AGE USAGE_ERROR WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
+EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED USAGE_AGE USAGE_ERROR WEEKLY_SCOPED WEEK_WINDOW_START WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
 for key in $EXPECTED_KEYS; do
     if echo "$OUTPUT1" | grep -q "^${key}="; then
         pass "key $key present"
@@ -1097,6 +1097,68 @@ else
 fi
 assert_eq "$(usage_field "$OUT31" TODAY_COST)" "24.00" "every decorated id matched the pricing table"
 
+# ============================================================
+echo ""
+echo "=== Test 32: week totals cover the rate limit window, not Monday-to-now ==="
+# ============================================================
+# `seven_day.resets_at` lands on a fixed weekday, so the seven days the ring
+# measures rarely start on a Monday. Counting tokens from Monday puts a total
+# from one window next to a percentage from another - on a Monday morning that
+# reads as if the whole weekly percentage came from today's few messages.
+ENV32=$(setup_env "test32")
+write_creds "$ENV32" "$FUTURE_MS"
+
+# Reset two days out ⇒ the window opened five days ago.
+RESET32=$(date -u -d "+2 days" +%Y-%m-%dT03:00:00+00:00)
+WINDOW32=$(date -d "-5 days" +%Y-%m-%d)
+BEFORE32=$(date -d "-6 days" +%Y-%m-%d)
+
+{
+    make_jsonl_line "$BEFORE32" "claude-opus-4" 1000 0 0 0 "sess-before"
+    make_jsonl_line "$WINDOW32" "claude-opus-4" 2000 0 0 0 "sess-edge"
+    make_jsonl_line "$TODAY" "claude-opus-4" 4000 0 0 0 "sess-today"
+} > "$ENV32/.claude/projects/test-project/test.jsonl"
+
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":71,\"resets_at\":\"$RESET32\"},\"extra_usage\":{\"is_enabled\":false},\"limits\":[{\"kind\":\"session\",\"percent\":10},{\"kind\":\"weekly_all\",\"percent\":71},{\"kind\":\"weekly_scoped\",\"percent\":6,\"scope\":{\"model\":{\"display_name\":\"Fable, 1M:x\"}}}]}"
+OUT32=$(run_script "$ENV32")
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+assert_eq "$(usage_field "$OUT32" WEEK_WINDOW_START)" "$WINDOW32" \
+    "the window starts seven days before the reset"
+assert_eq "$(usage_field "$OUT32" WEEK_TOKENS)" "6000" \
+    "only the days inside the window are counted"
+assert_eq "$(usage_field "$OUT32" WEEK_SESSIONS)" "2" \
+    "sessions follow the same window"
+assert_eq "$(usage_field "$OUT32" WEEK_MESSAGES)" "2" \
+    "messages follow the same window"
+# The strip below the rings is labelled Mo..Su, so it stays on calendar dates
+# even though the totals above it do not.
+TODAY_IDX32=$(( $(date +%u) - 1 ))
+DAILY32=$(usage_field "$OUT32" DAILY)
+assert_eq "$(echo "$DAILY32" | cut -d, -f$(( TODAY_IDX32 + 1 )))" "4000" \
+    "the daily strip still buckets by calendar day"
+assert_eq "$(usage_field "$OUT32" WEEKLY_SCOPED)" "Fable 1Mx:6" \
+    "a scoped weekly limit is reported per model, delimiters stripped"
+
+# Without a reset to align to there is no window, so the calendar week stands in.
+ENV32B=$(setup_env "test32b")
+CAL_WEEK32=$(date -d "$(( $(date +%u) - 1 )) days ago" +%Y-%m-%d)
+OUT32B=$(run_script "$ENV32B")
+assert_eq "$(usage_field "$OUT32B" WEEK_WINDOW_START)" "$CAL_WEEK32" \
+    "no usable reset falls back to the calendar week"
+assert_eq "$(usage_field "$OUT32B" WEEKLY_SCOPED)" "" \
+    "no response means no scoped limits are invented"
+
+# A plan with no per-model cap must not grow an empty row.
+ENV32C=$(setup_env "test32c")
+write_creds "$ENV32C" "$FUTURE_MS"
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":40,\"resets_at\":\"$RESET32\"},\"limits\":[{\"kind\":\"weekly_all\",\"percent\":40},{\"kind\":\"weekly_scoped\",\"percent\":3,\"scope\":null}]}"
+OUT32C=$(run_script "$ENV32C")
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+assert_eq "$(usage_field "$OUT32C" WEEKLY_SCOPED)" "" \
+    "a scoped row without a model name is dropped"
 # ============================================================
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

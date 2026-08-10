@@ -22,11 +22,29 @@ done
 
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
 TODAY=$(date +%Y-%m-%d)
-# Calendar week: Monday to Sunday
+# Calendar week: Monday to Sunday. Drives the Daily Activity strip (its labels
+# are Mo..Su) and is the fallback week for the totals when the API never
+# answered, so there is no rate limit window to align to.
 DOW=$(date +%u)  # 1=Monday, 7=Sunday
 WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
 # Calendar month: 1st of current month
 MONTH_START=$(date +%Y-%m-01)
+
+# The rate limit week does not start on Monday: `seven_day.resets_at` lands on a
+# fixed weekday (Thursday here), so the window that the 7-day ring measures is
+# the seven days before it. Totals labelled "week" have to use that window, or
+# the popout puts session counts, token totals and the model card from a Monday
+# week next to a ring from a Thursday one - on a Monday that reads as if the
+# whole 71% came from the one model used today.
+# Bucketing is date-granular everywhere in this script, so take the local date
+# of the boundary and accept that a few hours of its first day ride along.
+limit_week_start() {
+    local resets_at="$1" ws
+    [ -n "$resets_at" ] || return 1
+    ws=$(date -d "$resets_at - 7 days" +%Y-%m-%d 2>/dev/null) || return 1
+    [[ "$ws" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    printf '%s' "$ws"
+}
 
 # Defaults
 SUBSCRIPTION_TYPE="unknown"
@@ -38,6 +56,8 @@ SEVEN_DAY_RESET=""
 EXTRA_USAGE_ENABLED="false"
 USAGE_AGE=0
 USAGE_ERROR=""
+WEEKLY_SCOPED=""
+WEEK_WINDOW_START="$WEEK_START"
 
 WEEK_TOKENS=0
 WEEK_MESSAGES=0
@@ -134,11 +154,17 @@ else
 fi
 
 # --- Per-profile token counting ---
-# Usage: count_profile_tokens <projects_dir> <tmpfile>
+# Usage: count_profile_tokens <projects_dir> <tmpfile> [week_start]
 # Writes WEEK_TOKENS=N, WEEK_MESSAGES=N, ... to tmpfile
+#
+# `week_start` is the first day of the window the week totals cover - the rate
+# limit week when the API told us where it starts, the calendar week otherwise.
+# The Daily Activity strip is always the calendar week, because its labels are
+# fixed weekdays, so the two are computed separately on purpose.
 count_profile_tokens() {
     local proj_dir="$1"
     local out_file="$2"
+    local week_start="${3:-$WEEK_START}"
 
     # Day dates for the calendar week (same logic as outer scope)
     local day_dates=""
@@ -158,7 +184,7 @@ count_profile_tokens() {
             | (.timestamp // "") as $ts
             | ('"$JQ_DATE_EXPR"') as $d
             | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
-        | awk -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
+        | awk -v week_start="$week_start" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
         BEGIN {
             split(day_dates, dates, ",")
             has_pricing = 0
@@ -423,10 +449,19 @@ classify_usage_error() {
 }
 
 # --- Per-profile credentials + API usage fetcher ---
+# Every exit path emits the same field set, so one emitter owns the format and
+# the field order. Arguments, in order: out_file, subscription type, rate limit
+# tier, 5h utilization, 5h reset, 7d utilization, 7d reset, extra usage flag,
+# usage age, usage error, scoped weekly limits.
+write_usage_fields() {
+    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nUSAGE_AGE=%s\nUSAGE_ERROR=%s\nWEEKLY_SCOPED=%s\n' \
+        "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}" "${9}" "${10}" "${11}" > "$1"
+}
+
 # Usage: fetch_profile_usage <credentials_file> <cache_file> <out_tmpfile>
 # Writes SUBSCRIPTION_TYPE, RATE_LIMIT_TIER, FIVE_HOUR_UTIL, FIVE_HOUR_RESET,
 #        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED, USAGE_AGE,
-#        USAGE_ERROR to out_tmpfile
+#        USAGE_ERROR, WEEKLY_SCOPED to out_tmpfile
 #
 # USAGE_AGE/USAGE_ERROR describe how trustworthy the rate limit numbers are:
 #   USAGE_AGE=0   USAGE_ERROR=            fetched now, or cache still within TTL
@@ -442,12 +477,12 @@ fetch_profile_usage() {
     local sub_type="unknown"
     local tier="unknown"
     local five_util=0 five_reset="" seven_util=0 seven_reset="" extra="false"
-    local usage_age=0 usage_error=""
+    local usage_age=0 usage_error="" scoped=""
 
     if [ ! -f "$creds_file" ]; then
         usage_error="no_credentials"
-        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nUSAGE_AGE=%s\nUSAGE_ERROR=%s\n' \
-            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$usage_age" "$usage_error" > "$out_file"
+        write_usage_fields "$out_file" "$sub_type" "$tier" "$five_util" "$five_reset" \
+            "$seven_util" "$seven_reset" "$extra" "$usage_age" "$usage_error" "$scoped"
         return
     fi
 
@@ -568,9 +603,20 @@ fetch_profile_usage() {
     seven_util=$(echo "$api_resp" | jq -r '.seven_day.utilization // 0')
     seven_reset=$(echo "$api_resp" | jq -r '.seven_day.resets_at // ""')
     extra=$(echo "$api_resp" | jq -r '.extra_usage.is_enabled // false')
+    # `.limits` carries the rows claude.ai lists under "Weekly limits": the
+    # all-models cap, plus a scoped one per model that has its own cap (Fable
+    # today). `seven_day` is only the all-models row, so without these the
+    # widget cannot say a model is near its own limit while the total is fine.
+    scoped=$(echo "$api_resp" | jq -r '
+        [ (.limits // [])[]
+          | select(.kind == "weekly_scoped")
+          | ((.scope.model.display_name // "") | gsub("[,:|]"; "")) as $n
+          | select($n != "")
+          | "\($n):\(.percent // 0)" ]
+        | join(",")' 2>/dev/null || echo "")
 
-    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nUSAGE_AGE=%s\nUSAGE_ERROR=%s\n' \
-        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$usage_age" "$usage_error" > "$out_file"
+    write_usage_fields "$out_file" "$sub_type" "$tier" "$five_util" "$five_reset" \
+        "$seven_util" "$seven_reset" "$extra" "$usage_age" "$usage_error" "$scoped"
 }
 
 # --- Collect profile list ---
@@ -665,8 +711,15 @@ for idx in "${!PROFILE_DIRS[@]}"; do
     fi
 
     (
-        count_profile_tokens "${PROFILE_DIRS[$idx]}" "$tmpf"
+        # Usage first: its `seven_day.resets_at` decides which seven days the
+        # week totals below have to cover. Both still run in parallel across
+        # profiles, and the fetch is cache-backed, so this costs nothing.
         fetch_profile_usage "${PROFILE_CREDS[$idx]}" "$prof_cache" "$usage_tmpf"
+        prof_week_start=$(limit_week_start \
+            "$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2-)" \
+            || echo "$WEEK_START")
+        count_profile_tokens "${PROFILE_DIRS[$idx]}" "$tmpf" "$prof_week_start"
+        echo "WEEK_WINDOW_START=${prof_week_start}" >> "$tmpf"
     ) &
     PIDS+=("$!")
 done
@@ -700,6 +753,8 @@ PROF_SEVEN_DAY_RESET_LIST=""
 PROF_EXTRA_USAGE_LIST=""
 PROF_USAGE_AGE_LIST=""
 PROF_USAGE_ERROR_LIST=""
+PROF_WEEKLY_SCOPED_LIST=""
+PROF_WEEK_WINDOW_LIST=""
 
 for idx in "${!TMPFILES[@]}"; do
     tmpf="${TMPFILES[$idx]}"
@@ -714,6 +769,8 @@ for idx in "${!TMPFILES[@]}"; do
     p_mt=$(grep "^MONTH_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_daily=$(grep "^DAILY=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0,0,0,0,0,0,0")
     p_models=$(grep "^WEEK_MODELS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+    p_wws=$(grep "^WEEK_WINDOW_START=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "$WEEK_START")
+    [ -n "$p_wws" ] || p_wws="$WEEK_START"
     p_dc=$(grep "^DAILY_COSTS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00,0.00,0.00,0.00,0.00,0.00,0.00")
     p_tc=$(grep "^TODAY_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
     p_wc=$(grep "^WEEK_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
@@ -721,7 +778,7 @@ for idx in "${!TMPFILES[@]}"; do
 
     # Read per-profile usage/subscription
     p_sub="unknown"; p_tier="unknown"
-    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"; p_age=0; p_err=""
+    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"; p_age=0; p_err=""; p_scoped=""
     if [ -f "$usage_tmpf" ]; then
         p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
         p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
@@ -732,6 +789,7 @@ for idx in "${!TMPFILES[@]}"; do
         p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
         p_age=$(grep "^USAGE_AGE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
         p_err=$(grep "^USAGE_ERROR=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+        p_scoped=$(grep "^WEEKLY_SCOPED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
         [[ "$p_age" =~ ^[0-9]+$ ]] || p_age=0
     fi
 
@@ -746,6 +804,8 @@ for idx in "${!TMPFILES[@]}"; do
         EXTRA_USAGE_ENABLED="$p_extra"
         USAGE_AGE="$p_age"
         USAGE_ERROR="$p_err"
+        WEEKLY_SCOPED="$p_scoped"
+        WEEK_WINDOW_START="$p_wws"
     fi
 
     # Aggregate token totals
@@ -795,6 +855,10 @@ for idx in "${!TMPFILES[@]}"; do
     PROF_EXTRA_USAGE_LIST="${PROF_EXTRA_USAGE_LIST:+${PROF_EXTRA_USAGE_LIST},}${pname}:${p_extra}"
     PROF_USAGE_AGE_LIST="${PROF_USAGE_AGE_LIST:+${PROF_USAGE_AGE_LIST},}${pname}:${p_age}"
     PROF_USAGE_ERROR_LIST="${PROF_USAGE_ERROR_LIST:+${PROF_USAGE_ERROR_LIST},}${pname}:${p_err}"
+    # Scoped limits hold `Model:percent` pairs joined by `,`, so profiles are
+    # separated by `|` here the same way PROFILE_WEEK_MODELS does it.
+    PROF_WEEKLY_SCOPED_LIST="${PROF_WEEKLY_SCOPED_LIST:+${PROF_WEEKLY_SCOPED_LIST}|}${pname}:${p_scoped}"
+    PROF_WEEK_WINDOW_LIST="${PROF_WEEK_WINDOW_LIST:+${PROF_WEEK_WINDOW_LIST},}${pname}:${p_wws}"
 
     rm -f "$tmpf" "$usage_tmpf"
 done
@@ -824,6 +888,8 @@ echo "SEVEN_DAY_RESET=${SEVEN_DAY_RESET}"
 echo "EXTRA_USAGE_ENABLED=${EXTRA_USAGE_ENABLED}"
 echo "USAGE_AGE=${USAGE_AGE}"
 echo "USAGE_ERROR=${USAGE_ERROR}"
+echo "WEEKLY_SCOPED=${WEEKLY_SCOPED}"
+echo "WEEK_WINDOW_START=${WEEK_WINDOW_START}"
 echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
 echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
 echo "WEEK_TOKENS=${WEEK_TOKENS}"
@@ -858,3 +924,5 @@ echo "PROFILE_SEVEN_DAY_RESET=${PROF_SEVEN_DAY_RESET_LIST}"
 echo "PROFILE_EXTRA_USAGE=${PROF_EXTRA_USAGE_LIST}"
 echo "PROFILE_USAGE_AGE=${PROF_USAGE_AGE_LIST}"
 echo "PROFILE_USAGE_ERROR=${PROF_USAGE_ERROR_LIST}"
+echo "PROFILE_WEEKLY_SCOPED=${PROF_WEEKLY_SCOPED_LIST}"
+echo "PROFILE_WEEK_WINDOW_START=${PROF_WEEK_WINDOW_LIST}"

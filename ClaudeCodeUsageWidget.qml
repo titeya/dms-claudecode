@@ -56,6 +56,13 @@ PluginComponent {
     // being shown are, in seconds (0 = there is no data at all).
     property int usageAge: 0
     property string usageError: ""
+    // Per-model weekly limits, the rows claude.ai shows under the all-models
+    // one: [{ name, percent }]. Empty when the plan has no scoped model.
+    property var weeklyScoped: []
+    // First day (YYYY-MM-DD, local) of the window the week totals below cover.
+    // It is the rate limit week, which does not start on Monday, so the totals
+    // sit next to the 7-day ring measuring the same days.
+    property string weekWindowStart: ""
 
     // Weekly state
     property int weekMessages: 0
@@ -120,6 +127,18 @@ PluginComponent {
     property string displaySevenDayReset: currentPd && currentPd.sevenDayReset !== undefined ? currentPd.sevenDayReset : sevenDayReset
     property int displayUsageAge: currentPd && currentPd.usageAge !== undefined ? currentPd.usageAge : usageAge
     property string displayUsageError: currentPd && currentPd.usageError !== undefined ? currentPd.usageError : usageError
+    property var displayWeeklyScoped: currentPd && currentPd.weeklyScoped !== undefined ? currentPd.weeklyScoped : weeklyScoped
+    property string displayWeekWindowStart: currentPd && currentPd.weekWindowStart !== undefined ? currentPd.weekWindowStart : weekWindowStart
+    // "Since Aug 6" - which days the week totals in this card cover. Empty until
+    // a window is known, so nothing is claimed before the first fetch lands.
+    property string weekWindowLabel: {
+        if (!displayWeekWindowStart)
+            return "";
+        var d = new Date(displayWeekWindowStart + "T00:00:00");
+        if (isNaN(d.getTime()))
+            return "";
+        return tr("Since") + " " + Qt.formatDate(d, "MMM d");
+    }
 
     // One line telling the user the rate limit numbers are not live, and why.
     // Empty while the fetch is healthy, which is the normal case.
@@ -495,6 +514,28 @@ PluginComponent {
         }
         return _pd;
     }
+    // "Fable:6,Opus:12" -> [{ name: "Fable", percent: 6 }, ...]. The script strips
+    // `,` `:` `|` from model names, so splitting on them here is safe.
+    function parseScopedLimits(val) {
+        var out = [];
+        if (!val)
+            return out;
+        var entries = val.split(",");
+        for (var i = 0; i < entries.length; i++) {
+            var colon = entries[i].lastIndexOf(":");
+            if (colon <= 0)
+                continue;
+            var name = entries[i].substring(0, colon);
+            var pct = parseFloat(entries[i].substring(colon + 1));
+            if (name === "" || isNaN(pct))
+                continue;
+            out.push({
+                name: name,
+                percent: pct
+            });
+        }
+        return out;
+    }
 
     function parseProfileBool(val, field) {
         var _pd = Object.assign({}, profileData);
@@ -548,6 +589,12 @@ PluginComponent {
             break;
         case "USAGE_ERROR":
             usageError = val;
+            break;
+        case "WEEKLY_SCOPED":
+            weeklyScoped = parseScopedLimits(val);
+            break;
+        case "WEEK_WINDOW_START":
+            weekWindowStart = val;
             break;
         case "WEEK_MESSAGES":
             weekMessages = parseInt(val) || 0;
@@ -682,6 +729,29 @@ PluginComponent {
         case "PROFILE_USAGE_ERROR":
             profileData = parseProfileString(val, "usageError");
             break;
+        case "PROFILE_WEEK_WINDOW_START":
+            profileData = parseProfileString(val, "weekWindowStart");
+            break;
+        case "PROFILE_WEEKLY_SCOPED":
+            {
+                // Pipe-separated because the value itself holds `Model:percent`
+                // pairs joined by commas, same shape as PROFILE_WEEK_MODELS.
+                var _pd4 = Object.assign({}, profileData);
+                var blocks4 = val.split("|");
+                for (var bi4 = 0; bi4 < blocks4.length; bi4++) {
+                    var c4 = blocks4[bi4].indexOf(":");
+                    if (c4 < 0)
+                        continue;
+                    var pname4 = blocks4[bi4].substring(0, c4);
+                    if (!_pd4[pname4])
+                        _pd4[pname4] = {};
+                    else
+                        _pd4[pname4] = Object.assign({}, _pd4[pname4]);
+                    _pd4[pname4].weeklyScoped = parseScopedLimits(blocks4[bi4].substring(c4 + 1));
+                }
+                profileData = _pd4;
+                break;
+            }
         case "PROFILE_DAILY":
             {
                 var _pd1 = Object.assign({}, profileData);
@@ -1355,6 +1425,20 @@ PluginComponent {
                                 color: Theme.surfaceText
                                 wrapMode: Text.WordWrap
                             }
+                            // One row per model that has its own weekly cap. The
+                            // all-models ring can sit at 71% while a single model
+                            // is at 6%, so these are not derivable from it.
+                            Repeater {
+                                model: root.displayWeeklyScoped
+                                StyledText {
+                                    required property var modelData
+                                    width: parent.width
+                                    text: modelData.name + " · " + Math.round(modelData.percent) + "%" + root.staleMark
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: root.progressColor(modelData.percent)
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
                             StyledText {
                                 width: parent.width
                                 text: root.paceLabel(root.sevenDayPace)
@@ -1371,6 +1455,8 @@ PluginComponent {
                                         parts.push(root.displayWeekSessions + " " + root.tr("sessions"));
                                     if (root.displayWeekMessages > 0)
                                         parts.push(root.displayWeekMessages + " " + root.tr("msgs"));
+                                    if (root.weekWindowLabel !== "")
+                                        parts.push(root.weekWindowLabel);
                                     return parts.join(" · ");
                                 }
                                 font.pixelSize: Theme.fontSizeSmall
