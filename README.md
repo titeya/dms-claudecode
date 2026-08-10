@@ -25,6 +25,7 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
   - Profile overlay on the daily activity chart: grey bars show total usage, colored bars show the selected profile's share
   - Tooltip shows both total and per-profile token counts when a profile is selected
 - **Automatic subscription detection** via the Anthropic OAuth API
+- **Automatic token renewal** — the ~12h OAuth access token is refreshed with the stored refresh token when it expires, so the widget keeps working through the days you never launch Claude Code
 - **Dynamic model pricing** — new Anthropic model families are detected automatically, no code changes needed
 - **Currency support** — costs displayed in EUR for French locale, USD otherwise (exchange rate from ECB via [Frankfurter](https://www.frankfurter.app/))
 - **Configurable refresh interval** (2 to 15 minutes)
@@ -82,14 +83,14 @@ an auto-detected profile is skipped.
 
 The plugin runs a lightweight bash script at the configured interval that:
 
-1. Reads your OAuth token from `~/.claude/.credentials.json`
+1. Reads your OAuth token from `~/.claude/.credentials.json`, and renews it with the stored refresh token when it has expired (the same `refresh_token` grant Claude Code itself uses)
 2. Queries the Anthropic usage API for current rate limit status
 3. Scans `<config dir>/projects/` for every discovered profile (see above) for token consumption statistics — each profile is processed in parallel
 4. Fetches model pricing from LiteLLM and USD/EUR exchange rate from ECB (cached daily in `~/.claude/pricing-cache.json`)
 
-API usage responses are cached for 90 seconds (`~/.claude/usage-cache.json`) to avoid rate limiting; the popout refresh button skips that cache. If a fetch fails the cached numbers are still shown, but they are labelled with their age and the reason the fetch failed — an expired login in `~/.claude/.credentials.json` (run `claude` once to refresh it), a rate limit, or no connection.
+API usage responses are cached for 90 seconds (`~/.claude/usage-cache.json`) to avoid rate limiting; the popout refresh button skips that cache. If a fetch fails the cached numbers are still shown, but they are labelled with their age and the reason the fetch failed — a login that not even the refresh token can save (run `claude` once), a rate limit, or no connection.
 
-All data stays local. Network requests are limited to the official Anthropic API (usage), GitHub (LiteLLM pricing, once/day), and Frankfurter (exchange rate, once/day).
+All data stays local. Network requests are limited to the official Anthropic API (usage), the Claude OAuth token endpoint (only when the access token has to be renewed), GitHub (LiteLLM pricing, once/day), and Frankfurter (exchange rate, once/day).
 
 ## License
 
