@@ -842,6 +842,44 @@ assert_eq "$(usage_field "$OUT29" FIVE_HOUR_UTIL)" "7" "--force refetches past a
 assert_eq "$(usage_field "$OUT29" PROFILES)" "default" "--force is not registered as a profile"
 unset MOCK_CURL_CODE MOCK_CURL_BODY
 
+echo "=== Test 31: decorated model ids fold into their family ==="
+# ============================================================
+# Claude Code reports whatever id the backend uses: Bedrock adds a region and a
+# version (`us.anthropic.…-v1:0`), Vertex a publisher path or an `@date`, a proxy
+# its own prefix. Without normalisation each spelling becomes its own row in the
+# model card and misses the pricing table, so one model reads as four unpriced
+# ones.
+ENV31=$(setup_env "test31")
+cat > "$ENV31/.claude/pricing-cache.json" << 'PRICE31EOF'
+{
+    "updated": "2099-12-31",
+    "models": {
+        "sonnet": {"input": 0.000003, "output": 0.000015, "cache_read": 0.0000003, "cache_write": 0.00000375},
+        "opus": {"input": 0.000015, "output": 0.000075, "cache_read": 0.0000015, "cache_write": 0.00001875}
+    }
+}
+PRICE31EOF
+
+{
+    make_jsonl_line "$TODAY" "us.anthropic.claude-sonnet-4-5-20250929-v1:0" 1000000 0 0 0 "sess-bedrock"
+    make_jsonl_line "$TODAY" "claude-sonnet-4-5@20250929" 1000000 0 0 0 "sess-vertex"
+    make_jsonl_line "$TODAY" "cliproxy/claude-opus-5" 1000000 0 0 0 "sess-proxy"
+    make_jsonl_line "$TODAY" "claude-sonnet-4-20250514" 1000000 0 0 0 "sess-plain"
+    make_jsonl_line "$TODAY" "openrouter/qwen3-coder" 1000000 0 0 0 "sess-other"
+} > "$ENV31/.claude/projects/test-project/test.jsonl"
+
+OUT31=$(run_script "$ENV31")
+MODELS31=$(usage_field "$OUT31" WEEK_MODELS)
+assert_match "$MODELS31" "(^|,)sonnet=3000000(,|$)" "bedrock, vertex and plain ids all count as sonnet"
+assert_match "$MODELS31" "(^|,)opus=1000000(,|$)" "a proxy-prefixed id counts as opus"
+assert_match "$MODELS31" "(^|,)qwen3-coder=1000000(,|$)" "a non-Claude id keeps its name without the proxy prefix"
+if echo "$MODELS31" | grep -qE 'cliproxy|openrouter|anthropic|v1|@'; then
+    fail "decorated ids leaked into the model card ($MODELS31)"
+else
+    pass "no decorated id survives in the model card"
+fi
+assert_eq "$(usage_field "$OUT31" TODAY_COST)" "24.00" "every decorated id matched the pricing table"
+
 # ============================================================
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
