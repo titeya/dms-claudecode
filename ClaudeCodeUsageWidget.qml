@@ -16,14 +16,31 @@ PluginComponent {
         return Tr.tr(key, lang);
     }
 
-    // Calendar week labels: Monday to Sunday (fixed order)
+    // Weekday labels, Monday first. The Daily Activity strip starts on whatever
+    // day the rate limit window does, so the row is rotated to match instead of
+    // always reading Mo..Su - see dayLabels below.
     property int refreshEpoch: 0
     readonly property var dayLabelsByLanguage: ({
         en: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
         fr: ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"],
         es: ["Lu", "Ma", "Mi", "Ju", "Vi", "Sá", "Do"]
     })
-    property var dayLabels: dayLabelsByLanguage[lang] || dayLabelsByLanguage.en
+    readonly property var weekdayNames: dayLabelsByLanguage[lang] || dayLabelsByLanguage.en
+    property var dayLabels: rotateWeekdays(weekdayNames, displayWeekWindowStart)
+
+    // `base` is Monday-first; rotate it so index 0 is the weekday `windowStart`
+    // falls on. An unusable date leaves the row Monday-first, which is also what
+    // the script buckets by when it has no window to align to.
+    function rotateWeekdays(base, windowStart) {
+        var d = new Date(windowStart + "T00:00:00");
+        if (isNaN(d.getTime()))
+            return base;
+        var startDow = (d.getDay() + 6) % 7;
+        var out = [];
+        for (var i = 0; i < 7; i++)
+            out.push(base[(startDow + i) % 7]);
+        return out;
+    }
 
     // Settings
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
@@ -77,8 +94,11 @@ PluginComponent {
     property int alltimeMessages: 0
     property string firstSession: ""
 
-    // Daily breakdown (rolling 7 days, computed from JSONL files)
+    // The seven days of the rate limit window, in order, computed from JSONL files
     property var dailyTokens: [0, 0, 0, 0, 0, 0, 0]
+    // Counted by date rather than read out of the strip: on the morning of a
+    // reset day, today is not one of the seven days the strip covers.
+    property real todayTokens: 0
 
     // Estimated API cost (in USD)
     property real todayCost: 0
@@ -162,6 +182,7 @@ PluginComponent {
     property real displayWeekCost: currentPd && currentPd.weekCost !== undefined ? currentPd.weekCost : weekCost
     property real displayMonthCost: currentPd && currentPd.monthCost !== undefined ? currentPd.monthCost : monthCost
     property var displayDailyTokens: currentPd && currentPd.daily ? currentPd.daily : dailyTokens
+    property real displayTodayTokens: currentPd && currentPd.todayTokens !== undefined ? currentPd.todayTokens : todayTokens
 
     // Per-profile daily tokens for chart overlay. Empty array when "all" selected.
     property var profileDailyTokens: currentPd && currentPd.daily ? currentPd.daily : []
@@ -217,11 +238,26 @@ PluginComponent {
     // the horizontal and vertical pills so they never diverge.
     readonly property bool pillOverPace: showPacing && (pillFivePace.status === "over" || pillFivePace.status === "over_quota")
 
-    // Today's index in the calendar week (0=Monday, 6=Sunday)
+    // Where today sits in the seven days the strip covers, or -1 when it sits
+    // outside them - which happens between midnight and a reset later the same
+    // day, when the window on screen is still the one about to close.
     property int todayIndex: {
         void (countdownNow);
-        var dow = new Date().getDay(); // 0=Sunday, 6=Saturday
-        return dow === 0 ? 6 : dow - 1;
+        return windowDayIndex(displayWeekWindowStart, new Date());
+    }
+
+    // Column 0..6 of the strip that `when` falls in, or -1 outside the window.
+    // Compares calendar dates, so it never drifts with the time of day.
+    function windowDayIndex(windowStart, when) {
+        var start = new Date(windowStart + "T00:00:00");
+        if (isNaN(start.getTime()))
+            return -1;
+        var day = new Date(when.getFullYear(), when.getMonth(), when.getDate());
+        var diff = day.getTime() - start.getTime();
+        // Both ends are local midnights, so rounding absorbs the 23h and 25h
+        // days that daylight saving produces.
+        var days = Math.round(diff / 86400000);
+        return days >= 0 && days <= 6 ? days : -1;
     }
 
     // Derived
@@ -290,6 +326,16 @@ PluginComponent {
         if (n >= 1000)
             return (n / 1000).toFixed(1) + "K";
         return Math.round(n).toString();
+    }
+
+    // Calendar date of strip column `index`, as "Mon 10 Aug". The strip no longer
+    // starts on Monday, so a bare weekday label is not enough to place a bar.
+    function dayDate(index) {
+        var d = new Date(displayWeekWindowStart + "T00:00:00");
+        if (isNaN(d.getTime()) || index < 0)
+            return "";
+        d.setDate(d.getDate() + index);
+        return Qt.formatDate(d, "ddd d MMM");
     }
 
     // Seconds → "45m" / "3h 37m" / "2d 4h". Used for how old stale numbers are.
@@ -608,6 +654,9 @@ PluginComponent {
         case "MONTH_TOKENS":
             monthTokens = parseFloat(val) || 0;
             break;
+        case "TODAY_TOKENS":
+            todayTokens = parseFloat(val) || 0;
+            break;
         case "ALLTIME_SESSIONS":
             alltimeSessions = parseInt(val) || 0;
             break;
@@ -686,6 +735,9 @@ PluginComponent {
             break;
         case "PROFILE_MONTH_TOKENS":
             profileData = parseProfileSimple(val, "monthTokens", false);
+            break;
+        case "PROFILE_TODAY_TOKENS":
+            profileData = parseProfileSimple(val, "todayTokens", false);
             break;
         case "PROFILE_WEEK_MESSAGES":
             profileData = parseProfileSimple(val, "weekMessages", false);
@@ -1509,7 +1561,7 @@ PluginComponent {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                                 StyledText {
-                                    text: root.formatTokens(root.displayDailyTokens[root.todayIndex])
+                                    text: root.formatTokens(root.displayTodayTokens)
                                     font.pixelSize: Theme.fontSizeLarge
                                     font.weight: Font.DemiBold
                                     color: Theme.primary
@@ -1703,6 +1755,15 @@ PluginComponent {
                             id: tooltipCol
                             anchors.centerIn: parent
                             spacing: 1
+
+                            // Line 0: which day this bar is, since the strip can
+                            // start on any weekday
+                            StyledText {
+                                text: root.dayDate(root.hoveredDay)
+                                font.pixelSize: 10
+                                color: Theme.surfaceVariantText
+                                anchors.horizontalCenter: parent.horizontalCenter
+                            }
 
                             // Line 1: total tokens (with "total" suffix when a profile is selected)
                             StyledText {
