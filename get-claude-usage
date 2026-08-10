@@ -502,8 +502,10 @@ fetch_profile_usage() {
         else
             local http_code=000
             local raw=""
-            local attempt
-            for attempt in 1 2; do
+            # Two passes at most: the second only happens when the first got a 401
+            # and the refresh below produced a different token. The counter itself
+            # is never read, hence `_`.
+            for _ in 1 2; do
                 http_code=000
                 raw=""
                 api_resp="{}"
