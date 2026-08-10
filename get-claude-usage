@@ -180,8 +180,19 @@ count_profile_tokens() {
             sess = $7
             total = inp + out + cr + cw
 
-            n_parts = split(model, mparts, "-")
-            family = (n_parts >= 3 && mparts[1] == "claude") ? mparts[2] : model
+            # Model ids arrive decorated depending on how Claude Code reaches the
+            # model: a proxy or Vertex publisher prefix ("cliproxy/claude-opus-5"),
+            # a Bedrock region/vendor prefix and version suffix
+            # ("us.anthropic.claude-sonnet-4-5-20250929-v1:0"), or a Vertex date
+            # suffix ("claude-sonnet-4-5@20250929"). Strip the decoration before
+            # deriving the family, otherwise the same model bills and charts as
+            # several distinct rows and never matches the pricing table.
+            id = model
+            sub("^[^/]+/", "", id)
+            sub("^([a-z]+\\.)+", "", id)
+            sub("[:@].*$", "", id)
+            n_parts = split(id, mparts, "-")
+            family = (n_parts >= 3 && mparts[1] == "claude") ? mparts[2] : id
 
             day[date] += total
             if (date >= week_start) {
