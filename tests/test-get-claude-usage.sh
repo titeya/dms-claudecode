@@ -1210,5 +1210,73 @@ assert_eq "$(usage_field "$OUT33" PROFILE_TODAY_TOKENS)" "default:500" \
     "today is reported per profile too"
 # ============================================================
 echo ""
+echo "=== Test 34: bridged clients on the same subscription are counted ==="
+# ============================================================
+# Anything pointed at a bridge (cliproxyapi and friends) spends this very
+# subscription while writing its transcripts somewhere else entirely. Those
+# tokens are already inside the rate limit rings, so leaving them out is what
+# reads as broken: "today 0 tokens" under a ring that says 16% used.
+ENV34=$(setup_env "test34")
+
+# pi's layout: ~/.pi/agent/sessions/<cwd>/<stamp>_<uuid>.jsonl, plus one such
+# tree per named profile. Session ids live in the filename, not the records.
+mkdir -p "$ENV34/.pi/agent/sessions/--home-user--" "$ENV34/.pi/profiles/work/sessions/--home-user-src--"
+
+# Usage: make_bridged_line <date> <model> <input> <output> <cacheRead> <cacheWrite> [cost]
+make_bridged_line() {
+    local date="$1" model="$2" inp="$3" out="$4" cr="$5" cw="$6" cost="${7:-}"
+    local cost_json=""
+    [ -n "$cost" ] && cost_json=",\"cost\":{\"total\":$cost}"
+    printf '{"type":"message","timestamp":"%sT12:00:00Z","message":{"role":"assistant","model":"%s","usage":{"input":%d,"output":%d,"cacheRead":%d,"cacheWrite":%d%s}}}\n' \
+        "$date" "$model" "$inp" "$out" "$cr" "$cw" "$cost_json"
+}
+
+make_jsonl_line "$TODAY" "claude-opus-4" 100 0 0 0 "cc-session" \
+    > "$ENV34/.claude/projects/test-project/test.jsonl"
+{
+    make_bridged_line "$TODAY" "claude-opus-4" 10 20 30 40 "1.50"
+    # Same account, other harness, a model no pricing table knows: without the
+    # transcript's own cost this call would be free.
+    make_bridged_line "$TODAY" "claude-fable-5" 1 2 3 4 "0.25"
+    # Not Claude, not this subscription.
+    make_bridged_line "$TODAY" "gemini-3-pro" 5000 5000 0 0 "9.99"
+    # User turns and tool results are not billable assistant answers.
+    printf '{"type":"message","timestamp":"%sT12:00:00Z","message":{"role":"user","content":"hi"}}\n' "$TODAY"
+} > "$ENV34/.pi/agent/sessions/--home-user--/2026-08-17T08-00-00-000Z_aaaa-1111.jsonl"
+make_bridged_line "$TODAY" "claude-sonnet-4-5" 1000 0 0 0 "2.00" \
+    > "$ENV34/.pi/profiles/work/sessions/--home-user-src--/2026-08-17T09-00-00-000Z_bbbb-2222.jsonl"
+
+OUT34=$(run_script "$ENV34")
+
+assert_eq "$(usage_field "$OUT34" TODAY_TOKENS)" "1210" \
+    "bridged Claude tokens land in today's total, other vendors do not"
+assert_eq "$(usage_field "$OUT34" WEEK_SESSIONS)" "3" \
+    "each bridged transcript file counts as its own session"
+assert_eq "$(usage_field "$OUT34" WEEK_MESSAGES)" "4" \
+    "only assistant answers are counted as messages"
+assert_match "$(usage_field "$OUT34" WEEK_MODELS)" "fable=10" \
+    "a bridged model unknown to the pricing table still gets its own row"
+assert_eq "$(usage_field "$OUT34" TODAY_COST)" "3.75" \
+    "the cost the transcript computed itself is used, tables cannot price fable"
+assert_eq "$(usage_field "$OUT34" PROFILE_TODAY_TOKENS)" "default:1210" \
+    "bridged usage belongs to the login whose rings the popout shows"
+
+# The opt-out has to reproduce the old, Claude-Code-only numbers exactly.
+OUT34B=$(run_script "$ENV34" --no-bridged)
+assert_eq "$(usage_field "$OUT34B" TODAY_TOKENS)" "100" \
+    "--no-bridged counts Claude Code transcripts only"
+assert_eq "$(usage_field "$OUT34B" WEEK_SESSIONS)" "1" \
+    "--no-bridged leaves bridged sessions out of the session count"
+
+# A machine that never ran another client must behave exactly as before.
+ENV34C=$(setup_env "test34c")
+make_jsonl_line "$TODAY" "claude-opus-4" 100 0 0 0 "cc-session" \
+    > "$ENV34C/.claude/projects/test-project/test.jsonl"
+OUT34C=$(run_script "$ENV34C")
+assert_eq "$(usage_field "$OUT34C" TODAY_TOKENS)" "100" \
+    "no bridged transcripts anywhere changes nothing"
+
+# ============================================================
+echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -16,8 +16,16 @@ LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices
 # the cache to age out. Profile arguments are `name=path`, so a bare flag can
 # never collide with one.
 FORCE_FETCH=false
+# Claude Code is not the only client that spends this subscription: a bridge like
+# cliproxyapi lets other agent harnesses (pi, and anything else pointed at it)
+# talk to the same account, and those calls never touch ~/.claude/projects. With
+# only Claude Code transcripts counted, a day spent entirely in such a client
+# reads as "today 0 tokens" under a 5h ring that says 16% used. So their
+# transcripts are counted too, unless `--no-bridged` asks us not to.
+COUNT_BRIDGED=true
 for arg in "$@"; do
     [ "$arg" = "--force" ] && FORCE_FETCH=true
+    [ "$arg" = "--no-bridged" ] && COUNT_BRIDGED=false
 done
 
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
@@ -154,8 +162,81 @@ else
     JQ_DATE_EXPR='(if ($ts | length) >= 10 then $ts[:10] else "1970-01-01" end)'
 fi
 
+# --- Transcript record streams ---
+# Every producer below emits the same eight-field record, and the awk pass in
+# count_profile_tokens is the only thing that knows what to do with it:
+#
+#   <local date> <model> <input> <output> <cache read> <cache write> <session> <cost>
+#
+# `cost` is -1 when the transcript does not price the call itself, meaning "price
+# this from the litellm table". Claude Code transcripts always say -1; harnesses
+# that record their own cost (pi does) hand it over, which is the only way to
+# cost a model the pricing table has never heard of.
+
+# emit_claude_records <projects_dir>
+emit_claude_records() {
+    local proj_dir="$1"
+
+    find "$proj_dir" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
+        | jq -r -R 'fromjson? | select(.type == "assistant")
+            # Bucket by LOCAL calendar date, not UTC. Timestamps are ISO-8601 UTC
+            # (e.g. 2026-06-30T00:10:33Z); convert to the local date so the daily
+            # boundaries match TODAY/WEEK_START/MONTH_START (computed via local `date`)
+            # and the widget'"'"'s todayIndex. Falls back to the raw UTC slice if parsing
+            # fails or jq lacks strflocaltime (see JQ_DATE_EXPR probe above).
+            | (.timestamp // "") as $ts
+            | ('"$JQ_DATE_EXPR"') as $d
+            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") -1"'
+}
+
+# Where the bridged harnesses keep their transcripts. pi is the one that exists
+# today: `~/.pi/agent/sessions/<cwd>/<stamp>_<id>.jsonl`, plus one such tree per
+# named profile. PI_CONFIG_DIR moves the lot, so honour it.
+BRIDGED_ROOTS=()
+if [ "$COUNT_BRIDGED" = true ]; then
+    pi_home="${PI_CONFIG_DIR:-${HOME}/.pi}"
+    if [ -d "$pi_home" ]; then
+        for bridged_dir in "${pi_home}/agent/sessions" "${pi_home}"/profiles/*/sessions; do
+            [ -d "$bridged_dir" ] && BRIDGED_ROOTS+=("$bridged_dir")
+        done
+    fi
+    unset pi_home bridged_dir
+fi
+
+# emit_bridged_records
+# Only Claude models count: the same harness also drives Gemini and GPT, and
+# those tokens are nobody's Claude subscription. One jq per file because pi keeps
+# the session id in the filename (`<stamp>_<uuid>.jsonl`) and not in the records;
+# ids are prefixed so they can never collide with a Claude Code session uuid.
+emit_bridged_records() {
+    local root file sid
+
+    [ "${#BRIDGED_ROOTS[@]}" -gt 0 ] || return 0
+
+    for root in "${BRIDGED_ROOTS[@]}"; do
+        while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            sid="${file##*/}"
+            sid="${sid%.jsonl}"
+            sid="bridged:${sid##*_}"
+            jq -r -R --arg sid "$sid" 'fromjson? | select(.type == "message")
+                # The envelope timestamp is the one always present; the message
+                # carries its own copy for most record kinds.
+                | ((.timestamp // .message.timestamp // "")) as $ts
+                | ('"$JQ_DATE_EXPR"') as $d
+                | (.message // {})
+                | select(.role == "assistant")
+                | (.model // "unknown") as $m
+                | select($m | test("claude"; "i"))
+                | (.usage // {}) as $u
+                | "\($d) \($m) \($u.input // 0) \($u.output // 0) \($u.cacheRead // 0) \($u.cacheWrite // 0) \($sid) \($u.cost.total // -1)"' \
+                "$file" 2>/dev/null || true
+        done < <(find "$root" -name "*.jsonl" -mtime -31 2>/dev/null)
+    done
+}
+
 # --- Per-profile token counting ---
-# Usage: count_profile_tokens <projects_dir> <tmpfile> [week_start]
+# Usage: count_profile_tokens <projects_dir> <tmpfile> [week_start] [count_bridged]
 # Writes WEEK_TOKENS=N, WEEK_MESSAGES=N, ... to tmpfile
 #
 # `week_start` is the first day of the window the week totals cover - the rate
@@ -171,6 +252,9 @@ count_profile_tokens() {
     local proj_dir="$1"
     local out_file="$2"
     local week_start="${3:-$WEEK_START}"
+    # Bridged transcripts carry no profile of their own, so they belong to the
+    # login whose rate limit rings the popout shows: the default profile.
+    local count_bridged="${4:-false}"
 
     # The seven days of that window, in order, for the Daily Activity strip
     local day_dates=""
@@ -180,16 +264,10 @@ count_profile_tokens() {
         day_dates="${day_dates:+${day_dates},}${d}"
     done
 
-    find "$proj_dir" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
-        | jq -r -R 'fromjson? | select(.type == "assistant")
-            # Bucket by LOCAL calendar date, not UTC. Timestamps are ISO-8601 UTC
-            # (e.g. 2026-06-30T00:10:33Z); convert to the local date so the daily
-            # boundaries match TODAY/WEEK_START/MONTH_START (computed via local `date`)
-            # and the widget'"'"'s todayIndex. Falls back to the raw UTC slice if parsing
-            # fails or jq lacks strflocaltime (see JQ_DATE_EXPR probe above).
-            | (.timestamp // "") as $ts
-            | ('"$JQ_DATE_EXPR"') as $d
-            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
+    {
+        emit_claude_records "$proj_dir"
+        [ "$count_bridged" = true ] && emit_bridged_records
+    } \
         | awk -v week_start="$week_start" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
         BEGIN {
             split(day_dates, dates, ",")
@@ -210,6 +288,7 @@ count_profile_tokens() {
             date = $1; model = $2
             inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
             sess = $7
+            rec_cost = ($8 == "") ? -1 : $8 + 0
             total = inp + out + cr + cw
 
             # Model ids arrive decorated depending on how Claude Code reaches the
@@ -235,8 +314,17 @@ count_profile_tokens() {
             }
             if (date >= month_start) month_tokens += total
 
-            if (has_pricing && (family in price_in)) {
+            # A cost the transcript computed itself wins: it priced the exact
+            # model that answered, including ones the litellm table has never
+            # heard of, where the table lookup below finds nothing and the call
+            # would otherwise cost zero.
+            cost = -1
+            if (rec_cost >= 0) {
+                cost = rec_cost
+            } else if (has_pricing && (family in price_in)) {
                 cost = inp * price_in[family] + out * price_out[family] + cr * price_cr[family] + cw * price_cw[family]
+            }
+            if (cost >= 0) {
                 day_cost[date] += cost
                 if (date >= week_start) week_cost += cost
                 if (date >= month_start) month_cost += cost
@@ -728,7 +816,9 @@ for idx in "${!PROFILE_DIRS[@]}"; do
         prof_week_start=$(limit_week_start \
             "$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2-)" \
             || echo "$WEEK_START")
-        count_profile_tokens "${PROFILE_DIRS[$idx]}" "$tmpf" "$prof_week_start"
+        prof_bridged=false
+        [ "$pname" = "default" ] && prof_bridged="$COUNT_BRIDGED"
+        count_profile_tokens "${PROFILE_DIRS[$idx]}" "$tmpf" "$prof_week_start" "$prof_bridged"
         echo "WEEK_WINDOW_START=${prof_week_start}" >> "$tmpf"
     ) &
     PIDS+=("$!")

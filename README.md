@@ -25,6 +25,7 @@ A [DMS (Dank Material Shell)](https://github.com/AvengeMedia/DankMaterialShell) 
   - Any directory you add manually under **Custom Profiles** in the plugin settings
   - Profile overlay on the daily activity chart: grey bars show total usage, colored bars show the selected profile's share
   - Tooltip shows both total and per-profile token counts when a profile is selected
+- **Counts every client on the subscription** — an agent harness that reaches Anthropic through a bridge (e.g. [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)) spends the same rate limit budget while writing its transcripts elsewhere, so those Claude calls are counted too. Without it a day spent in such a client reads as "today: 0 tokens" under a 5-hour ring that says 16% used. Currently detects [pi](https://github.com/badlogic/pi-mono) transcripts (`~/.pi/agent/sessions/`, `~/.pi/profiles/*/sessions/`, or `$PI_CONFIG_DIR`); only Claude models are counted, and can be turned off in the settings
 - **Automatic subscription detection** via the Anthropic OAuth API
 - **Automatic token renewal** — the ~12h OAuth access token is refreshed with the stored refresh token when it expires, so the widget keeps working through the days you never launch Claude Code
 - **Dynamic model pricing** — new Anthropic model families are detected automatically, no code changes needed
@@ -62,7 +63,8 @@ Then restart DMS.
 ## Configuration
 
 Open DMS Settings (`Mod + ,` > Plugins > Claude Code Usage) to adjust the refresh interval,
-toggle pacing indicators, and register custom profiles.
+toggle pacing indicators, toggle counting of other clients on the subscription, and
+register custom profiles.
 
 ### Custom Profiles
 
@@ -87,7 +89,8 @@ The plugin runs a lightweight bash script at the configured interval that:
 1. Reads your OAuth token from `~/.claude/.credentials.json`, and renews it with the stored refresh token when it has expired (the same `refresh_token` grant Claude Code itself uses)
 2. Queries the Anthropic usage API for current rate limit status
 3. Scans `<config dir>/projects/` for every discovered profile (see above) for token consumption statistics — each profile is processed in parallel
-4. Fetches model pricing from LiteLLM and USD/EUR exchange rate from ECB (cached daily in `~/.claude/pricing-cache.json`)
+4. Scans the transcripts of other clients on the same subscription (pi sessions, unless **Count other clients** is off) and attributes their Claude calls to the `default` profile, since they bill the login whose rate limits the popout shows. Where such a transcript records its own cost, that cost is used — it prices the exact model that answered, including ones LiteLLM has never heard of
+5. Fetches model pricing from LiteLLM and USD/EUR exchange rate from ECB (cached daily in `~/.claude/pricing-cache.json`)
 
 API usage responses are cached for 90 seconds (`~/.claude/usage-cache.json`) to avoid rate limiting; the popout refresh button skips that cache. If a fetch fails the cached numbers are still shown, but they are labelled with their age and the reason the fetch failed — a login that not even the refresh token can save (run `claude` once), a rate limit, or no connection.
 

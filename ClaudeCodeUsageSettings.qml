@@ -49,6 +49,13 @@ PluginSettings {
         defaultValue: true
     }
 
+    ToggleSetting {
+        settingKey: "countBridged"
+        label: root.tr("Count other clients")
+        description: root.tr("Also count agents that reach this subscription through a bridge, not only Claude Code")
+        defaultValue: true
+    }
+
     Rectangle {
         width: parent.width
         height: 1

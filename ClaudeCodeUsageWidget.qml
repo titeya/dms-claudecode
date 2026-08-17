@@ -45,6 +45,11 @@ PluginComponent {
     // Settings
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
     property bool showPacing: pluginData.showPacing !== false
+    // Count the transcripts of other clients on this subscription (a harness
+    // reaching Anthropic through a bridge like cliproxyapi). On by default: their
+    // tokens are already inside the rate limit rings, so leaving them out is what
+    // looks broken - "today 0" under a ring that says 16% used.
+    property bool countBridged: pluginData.countBridged !== false
     property var customProfiles: pluginData.customProfiles || []
     // A refresh asked for while one is already in flight. onExited starts it,
     // so the request is queued rather than dropped.
@@ -920,7 +925,7 @@ PluginComponent {
         // `--force` makes the script skip its usage cache TTL, so the manual
         // refresh actually refetches instead of replaying the same cached
         // response. Profile arguments are `name=path`, never a bare flag.
-        command: ["timeout", "120", "bash", root.scriptPath].concat(root.forceFetch ? ["--force"] : []).concat(root.customProfiles.filter(p => p && p.name && p.path).map(p => p.name + "=" + p.path))
+        command: ["timeout", "120", "bash", root.scriptPath].concat(root.forceFetch ? ["--force"] : []).concat(root.countBridged ? [] : ["--no-bridged"]).concat(root.customProfiles.filter(p => p && p.name && p.path).map(p => p.name + "=" + p.path))
         running: false
 
         stdout: SplitParser {

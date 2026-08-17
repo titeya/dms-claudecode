@@ -35,6 +35,10 @@ var strings = {
         { fr: "messages", es: "mensajes" },
     "Daily Activity":
         { fr: "Activité quotidienne", es: "Actividad diaria" },
+    "Count other clients":
+        { fr: "Compter les autres clients", es: "Contar otros clientes" },
+    "Also count agents that reach this subscription through a bridge, not only Claude Code":
+        { fr: "Compter aussi les agents qui utilisent cet abonnement via une passerelle, pas seulement Claude Code", es: "Contar también los agentes que usan esta suscripción mediante un puente, no solo Claude Code" },
     "Token Consumption":
         { fr: "Consommation de tokens", es: "Consumo de tokens" },
     "Today":
