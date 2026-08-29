@@ -9,6 +9,7 @@ STATS_CACHE="${CLAUDE_DIR}/stats-cache.json"
 PRICING_CACHE="${CLAUDE_DIR}/pricing-cache.json"
 USAGE_CACHE="${CLAUDE_DIR}/usage-cache.json"
 USAGE_CACHE_TTL=90  # seconds, below the 2 min minimum refresh interval
+USAGE_STALE_MAX_AGE=86400  # seconds; beyond this, a failed API call is not backed by cache
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
@@ -27,6 +28,7 @@ FIVE_HOUR_RESET=""
 SEVEN_DAY_UTIL=0
 SEVEN_DAY_RESET=""
 EXTRA_USAGE_ENABLED="false"
+USAGE_STALE="false"
 
 WEEK_TOKENS=0
 WEEK_MESSAGES=0
@@ -229,7 +231,10 @@ count_profile_tokens() {
 # --- Per-profile credentials + API usage fetcher ---
 # Usage: fetch_profile_usage <credentials_file> <cache_file> <out_tmpfile>
 # Writes SUBSCRIPTION_TYPE, RATE_LIMIT_TIER, FIVE_HOUR_UTIL, FIVE_HOUR_RESET,
-#        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED to out_tmpfile
+#        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED, USAGE_STALE to out_tmpfile
+# USAGE_STALE is "true" whenever the values shown were NOT just confirmed live —
+# i.e. the API call failed and we either reused an old cached response (still
+# within USAGE_STALE_MAX_AGE) or had nothing usable to fall back on at all.
 fetch_profile_usage() {
     local creds_file="$1"
     local cache_file="$2"
@@ -238,10 +243,11 @@ fetch_profile_usage() {
     local sub_type="unknown"
     local tier="unknown"
     local five_util=0 five_reset="" seven_util=0 seven_reset="" extra="false"
+    local stale="false"
 
     if [ ! -f "$creds_file" ]; then
-        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\n' \
-            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" > "$out_file"
+        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nUSAGE_STALE=%s\n' \
+            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$stale" > "$out_file"
         return
     fi
 
@@ -292,9 +298,20 @@ fetch_profile_usage() {
                 else
                     rm -f "$cache_tmp"
                 fi
-            elif [ "$cache_matches" = true ]; then
-                api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+            else
+                # Live call failed (expired/invalid token, network error, ...).
+                # Only fall back to the old cache within a bounded staleness
+                # window — past that, an ancient response would look just as
+                # "current" as a live one, silently misleading the widget.
+                stale="true"
+                if [ "$cache_matches" = true ] && [ "$age" -lt "$USAGE_STALE_MAX_AGE" ]; then
+                    api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+                else
+                    api_resp="{}"
+                fi
             fi
+        else
+            stale="true"
         fi
     fi
 
@@ -304,8 +321,8 @@ fetch_profile_usage() {
     seven_reset=$(echo "$api_resp" | jq -r '.seven_day.resets_at // ""')
     extra=$(echo "$api_resp" | jq -r '.extra_usage.is_enabled // false')
 
-    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\n' \
-        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" > "$out_file"
+    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nUSAGE_STALE=%s\n' \
+        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$stale" > "$out_file"
 }
 
 # --- Collect profile list ---
@@ -433,6 +450,7 @@ PROF_SEVEN_DAY_UTIL=""
 PROF_FIVE_HOUR_RESET_LIST=""
 PROF_SEVEN_DAY_RESET_LIST=""
 PROF_EXTRA_USAGE_LIST=""
+PROF_USAGE_STALE_LIST=""
 
 for idx in "${!TMPFILES[@]}"; do
     tmpf="${TMPFILES[$idx]}"
@@ -454,7 +472,7 @@ for idx in "${!TMPFILES[@]}"; do
 
     # Read per-profile usage/subscription
     p_sub="unknown"; p_tier="unknown"
-    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"
+    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"; p_stale="false"
     if [ -f "$usage_tmpf" ]; then
         p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
         p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
@@ -463,6 +481,7 @@ for idx in "${!TMPFILES[@]}"; do
         p_7u=$(grep "^SEVEN_DAY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
         p_7r=$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
         p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
+        p_stale=$(grep "^USAGE_STALE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
     fi
 
     # Default profile drives the top-level aggregate fields
@@ -474,6 +493,7 @@ for idx in "${!TMPFILES[@]}"; do
         SEVEN_DAY_UTIL="$p_7u"
         SEVEN_DAY_RESET="$p_7r"
         EXTRA_USAGE_ENABLED="$p_extra"
+        USAGE_STALE="$p_stale"
     fi
 
     # Aggregate token totals
@@ -521,6 +541,7 @@ for idx in "${!TMPFILES[@]}"; do
     PROF_FIVE_HOUR_RESET_LIST="${PROF_FIVE_HOUR_RESET_LIST:+${PROF_FIVE_HOUR_RESET_LIST},}${pname}:${p_5r}"
     PROF_SEVEN_DAY_RESET_LIST="${PROF_SEVEN_DAY_RESET_LIST:+${PROF_SEVEN_DAY_RESET_LIST},}${pname}:${p_7r}"
     PROF_EXTRA_USAGE_LIST="${PROF_EXTRA_USAGE_LIST:+${PROF_EXTRA_USAGE_LIST},}${pname}:${p_extra}"
+    PROF_USAGE_STALE_LIST="${PROF_USAGE_STALE_LIST:+${PROF_USAGE_STALE_LIST},}${pname}:${p_stale}"
 
     rm -f "$tmpf" "$usage_tmpf"
 done
@@ -548,6 +569,7 @@ echo "FIVE_HOUR_RESET=${FIVE_HOUR_RESET}"
 echo "SEVEN_DAY_UTIL=${SEVEN_DAY_UTIL}"
 echo "SEVEN_DAY_RESET=${SEVEN_DAY_RESET}"
 echo "EXTRA_USAGE_ENABLED=${EXTRA_USAGE_ENABLED}"
+echo "USAGE_STALE=${USAGE_STALE}"
 echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
 echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
 echo "WEEK_TOKENS=${WEEK_TOKENS}"
@@ -580,3 +602,4 @@ echo "PROFILE_SEVEN_DAY_UTIL=${PROF_SEVEN_DAY_UTIL}"
 echo "PROFILE_FIVE_HOUR_RESET=${PROF_FIVE_HOUR_RESET_LIST}"
 echo "PROFILE_SEVEN_DAY_RESET=${PROF_SEVEN_DAY_RESET_LIST}"
 echo "PROFILE_EXTRA_USAGE=${PROF_EXTRA_USAGE_LIST}"
+echo "PROFILE_USAGE_STALE=${PROF_USAGE_STALE_LIST}"

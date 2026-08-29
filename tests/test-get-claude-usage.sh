@@ -42,6 +42,18 @@ run_script() {
     HOME="$home_dir" PATH="$TMPDIR_ROOT:$PATH" bash "$SCRIPT" "$@" 2>/dev/null
 }
 
+# Like run_script, but with a custom curl mock (for simulating a successful
+# API response, distinct from the default always-empty mock above).
+run_script_with_curl() {
+    local home_dir="$1" curl_body="$2"
+    shift 2
+    local curl_dir="$TMPDIR_ROOT/curlbin_$RANDOM$RANDOM"
+    mkdir -p "$curl_dir"
+    printf '%s\n' "$curl_body" > "$curl_dir/curl"
+    chmod +x "$curl_dir/curl"
+    HOME="$home_dir" PATH="$curl_dir:$TMPDIR_ROOT:$PATH" bash "$SCRIPT" "$@" 2>/dev/null
+}
+
 # Build a JSONL fixture line
 # Usage: make_jsonl_line <date> <model> <input> <output> <cache_read> <cache_write> <sessionId>
 make_jsonl_line() {
@@ -56,7 +68,7 @@ echo "=== Test 1: Output format — all 21 keys present ==="
 ENV1=$(setup_env "test1")
 OUTPUT1=$(run_script "$ENV1")
 
-EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
+EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED USAGE_STALE WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
 for key in $EXPECTED_KEYS; do
     if echo "$OUTPUT1" | grep -q "^${key}="; then
         pass "key $key present"
@@ -714,6 +726,91 @@ if echo "$PROFILES27C" | tr ',' '\n' | grep -q '^alias$'; then
 else
     pass "duplicate config directory registered only once"
 fi
+
+# ============================================================
+echo "=== Test 28: Live API success — USAGE_STALE=false, fresh values used ==="
+# ============================================================
+ENV28=$(setup_env "test28")
+cat > "$ENV28/.claude/.credentials.json" << 'CREDEOF'
+{
+    "claudeAiOauth": {
+        "subscriptionType": "pro",
+        "rateLimitTier": "t1_pro",
+        "accessToken": "fake-token"
+    }
+}
+CREDEOF
+OUTPUT28=$(run_script_with_curl "$ENV28" \
+    'echo "{\"five_hour\":{\"utilization\":55,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":20,\"resets_at\":\"2099-01-07T00:00:00Z\"}}"')
+assert_eq "$(echo "$OUTPUT28" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "55" "Live success: FIVE_HOUR_UTIL from API"
+assert_eq "$(echo "$OUTPUT28" | grep "^USAGE_STALE=" | cut -d= -f2)" "false" "Live success: USAGE_STALE=false"
+
+# ============================================================
+echo "=== Test 29: API failure, cache within staleness window — old data served, marked stale ==="
+# ============================================================
+ENV29=$(setup_env "test29")
+cat > "$ENV29/.claude/.credentials.json" << 'CREDEOF'
+{
+    "claudeAiOauth": {
+        "subscriptionType": "pro",
+        "rateLimitTier": "t1_pro",
+        "accessToken": "expired-token"
+    }
+}
+CREDEOF
+# Cache is older than USAGE_CACHE_TTL (so the script must attempt a live call)
+# but well within USAGE_STALE_MAX_AGE (86400s) — one hour old.
+STALE_TS=$(( $(date +%s) - 3600 ))
+cat > "$ENV29/.claude/usage-cache.json" << CACHEEOF
+{
+    "cached_at": $STALE_TS,
+    "identity": "$ENV29/.claude/.credentials.json",
+    "data": {
+        "five_hour": {"utilization": 77, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 33, "resets_at": "2099-01-07T00:00:00Z"}
+    }
+}
+CACHEEOF
+# Default mock curl (always returns "{}") simulates a failed/expired-token API call
+OUTPUT29=$(run_script "$ENV29")
+assert_eq "$(echo "$OUTPUT29" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "77" "1h-old cache still served on API failure"
+assert_eq "$(echo "$OUTPUT29" | grep "^USAGE_STALE=" | cut -d= -f2)" "true" "1h-old fallback marked USAGE_STALE=true"
+
+# ============================================================
+echo "=== Test 30: API failure, cache older than USAGE_STALE_MAX_AGE — not served, marked stale ==="
+# ============================================================
+ENV30=$(setup_env "test30")
+cat > "$ENV30/.claude/.credentials.json" << 'CREDEOF'
+{
+    "claudeAiOauth": {
+        "subscriptionType": "pro",
+        "rateLimitTier": "t1_pro",
+        "accessToken": "expired-token"
+    }
+}
+CREDEOF
+# Cache is 3 days old — well past USAGE_STALE_MAX_AGE (86400s = 1 day)
+ANCIENT_TS=$(( $(date +%s) - 259200 ))
+cat > "$ENV30/.claude/usage-cache.json" << CACHEEOF
+{
+    "cached_at": $ANCIENT_TS,
+    "identity": "$ENV30/.claude/.credentials.json",
+    "data": {
+        "five_hour": {"utilization": 80, "resets_at": "2020-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 10, "resets_at": "2020-01-07T00:00:00Z"}
+    }
+}
+CACHEEOF
+OUTPUT30=$(run_script "$ENV30")
+assert_eq "$(echo "$OUTPUT30" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "0" "3-day-old cache not served, defaults to unknown"
+assert_eq "$(echo "$OUTPUT30" | grep "^USAGE_STALE=" | cut -d= -f2)" "true" "Ancient/no fallback marked USAGE_STALE=true"
+
+# ============================================================
+echo "=== Test 31: Missing credentials — USAGE_STALE=false (not-logged-in, not stale) ==="
+# ============================================================
+ENV31=$(setup_env "test31")
+OUTPUT31=$(run_script "$ENV31")
+assert_eq "$(echo "$OUTPUT31" | grep "^USAGE_STALE=" | cut -d= -f2)" "false" "Missing credentials: USAGE_STALE=false"
 
 # ============================================================
 echo ""

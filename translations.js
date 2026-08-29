@@ -5,6 +5,8 @@ var strings = {
         { fr: "Utilisation Claude Code", es: "Uso de Claude Code" },
     "Subscription":
         { fr: "Abonnement", es: "Suscripción" },
+    "Live check failed — showing cached data":
+        { fr: "Échec de la vérification en direct — affichage des données en cache", es: "Fallo la verificación en vivo — mostrando datos en caché" },
     "5h Rate Window":
         { fr: "Fenêtre de 5 h", es: "Ventana de 5 h" },
     "used":

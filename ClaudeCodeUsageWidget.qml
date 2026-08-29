@@ -39,6 +39,10 @@ PluginComponent {
     property real sevenDayUtil: 0
     property string sevenDayReset: ""
     property bool extraUsageEnabled: false
+    // True when the values above are NOT freshly confirmed — the last live
+    // usage check failed (e.g. expired credentials) and we're either showing
+    // an older cached snapshot or, past USAGE_STALE_MAX_AGE, no data at all.
+    property bool usageStale: false
 
     // Weekly state
     property int weekMessages: 0
@@ -101,6 +105,7 @@ PluginComponent {
     property string displayFiveHourReset: currentPd && currentPd.fiveHourReset !== undefined ? currentPd.fiveHourReset : fiveHourReset
     property real displaySevenDayUtil: currentPd && currentPd.sevenDayUtil !== undefined ? currentPd.sevenDayUtil : sevenDayUtil
     property string displaySevenDayReset: currentPd && currentPd.sevenDayReset !== undefined ? currentPd.sevenDayReset : sevenDayReset
+    property bool displayUsageStale: currentPd && currentPd.usageStale !== undefined ? currentPd.usageStale : usageStale
     property real displayWeekTokens: currentPd && currentPd.weekTokens !== undefined ? currentPd.weekTokens : weekTokens
     property int displayWeekMessages: currentPd && currentPd.weekMessages !== undefined ? currentPd.weekMessages : weekMessages
     property int displayWeekSessions: currentPd && currentPd.weekSessions !== undefined ? currentPd.weekSessions : weekSessions
@@ -474,6 +479,9 @@ PluginComponent {
         case "EXTRA_USAGE_ENABLED":
             extraUsageEnabled = (val === "true");
             break;
+        case "USAGE_STALE":
+            usageStale = (val === "true");
+            break;
         case "WEEK_MESSAGES":
             weekMessages = parseInt(val) || 0;
             break;
@@ -600,6 +608,9 @@ PluginComponent {
             break;
         case "PROFILE_EXTRA_USAGE":
             profileData = parseProfileBool(val, "extraUsageEnabled");
+            break;
+        case "PROFILE_USAGE_STALE":
+            profileData = parseProfileBool(val, "usageStale");
             break;
         case "PROFILE_DAILY":
             {
@@ -775,7 +786,7 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.fiveHourUtil) + "%" + (root.usageStale ? " ⚠" : "") + (root.pillOverPace ? " ↑" : "")
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
                 color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
                 anchors.verticalCenter: parent.verticalCenter
@@ -822,7 +833,7 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.fiveHourUtil) + "%" + (root.usageStale ? " ⚠" : "") + (root.pillOverPace ? " ↑" : "")
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
                 color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -972,7 +983,10 @@ PluginComponent {
             headerText: root.tr("Claude Code Usage")
             detailsText: {
                 var label = root.formatSubscription(root.displaySubscriptionType, root.displayRateLimitTier);
-                return label ? root.tr("Subscription") + ": " + label : "";
+                var text = label ? root.tr("Subscription") + ": " + label : "";
+                if (root.displayUsageStale)
+                    text += (text ? " · " : "") + root.tr("Live check failed — showing cached data");
+                return text;
             }
             showCloseButton: true
 
