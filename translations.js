@@ -13,6 +13,20 @@ var strings = {
         { fr: "Réinitialisation dans", es: "Restablecimiento en" },
     "Resetting...":
         { fr: "Réinitialisation...", es: "Restableciendo..." },
+    "old":
+        { fr: "d'ancienneté", es: "de antigüedad" },
+    "Claude Code login expired - run claude once":
+        { fr: "Session Claude Code expirée - lancez claude une fois", es: "Sesión de Claude Code caducada - ejecuta claude una vez" },
+    "API rate limited":
+        { fr: "Limite de l'API atteinte", es: "Límite de la API alcanzado" },
+    "Not authorized":
+        { fr: "Non autorisé", es: "No autorizado" },
+    "No connection":
+        { fr: "Pas de connexion", es: "Sin conexión" },
+    "Not signed in":
+        { fr: "Non connecté", es: "No has iniciado sesión" },
+    "Unexpected API response":
+        { fr: "Réponse inattendue de l'API", es: "Respuesta inesperada de la API" },
     "7-Day Usage":
         { fr: "Utilisation sur 7 jours", es: "Uso durante 7 días" },
     "sessions":
@@ -21,6 +35,10 @@ var strings = {
         { fr: "messages", es: "mensajes" },
     "Daily Activity":
         { fr: "Activité quotidienne", es: "Actividad diaria" },
+    "Count other clients":
+        { fr: "Compter les autres clients", es: "Contar otros clientes" },
+    "Also count agents that reach this subscription through a bridge, not only Claude Code":
+        { fr: "Compter aussi les agents qui utilisent cet abonnement via une passerelle, pas seulement Claude Code", es: "Contar también los agentes que usan esta suscripción mediante un puente, no solo Claude Code" },
     "Token Consumption":
         { fr: "Consommation de tokens", es: "Consumo de tokens" },
     "Today":

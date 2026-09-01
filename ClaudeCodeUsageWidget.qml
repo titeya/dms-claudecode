@@ -16,20 +16,54 @@ PluginComponent {
         return Tr.tr(key, lang);
     }
 
-    // Calendar week labels: Monday to Sunday (fixed order)
+    // Weekday labels, Monday first. The Daily Activity strip starts on whatever
+    // day the rate limit window does, so the row is rotated to match instead of
+    // always reading Mo..Su - see dayLabels below.
     property int refreshEpoch: 0
     readonly property var dayLabelsByLanguage: ({
         en: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"],
         fr: ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"],
         es: ["Lu", "Ma", "Mi", "Ju", "Vi", "Sá", "Do"]
     })
-    property var dayLabels: dayLabelsByLanguage[lang] || dayLabelsByLanguage.en
+    readonly property var weekdayNames: dayLabelsByLanguage[lang] || dayLabelsByLanguage.en
+    property var dayLabels: rotateWeekdays(weekdayNames, displayWeekWindowStart)
+
+    // `base` is Monday-first; rotate it so index 0 is the weekday `windowStart`
+    // falls on. An unusable date leaves the row Monday-first, which is also what
+    // the script buckets by when it has no window to align to.
+    function rotateWeekdays(base, windowStart) {
+        var d = new Date(windowStart + "T00:00:00");
+        if (isNaN(d.getTime()))
+            return base;
+        var startDow = (d.getDay() + 6) % 7;
+        var out = [];
+        for (var i = 0; i < 7; i++)
+            out.push(base[(startDow + i) % 7]);
+        return out;
+    }
 
     // Settings
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
     property bool showPacing: pluginData.showPacing !== false
+    // Count the transcripts of other clients on this subscription (a harness
+    // reaching Anthropic through a bridge like cliproxyapi). On by default: their
+    // tokens are already inside the rate limit rings, so leaving them out is what
+    // looks broken - "today 0" under a ring that says 16% used.
+    property bool countBridged: pluginData.countBridged !== false
     property var customProfiles: pluginData.customProfiles || []
-    property bool customProfilesRefreshPending: false
+    // A refresh asked for while one is already in flight. onExited starts it,
+    // so the request is queued rather than dropped.
+    property bool rerunPending: false
+    // Passed to the script as `--force`: manual refresh ignores the usage cache.
+    property bool forceFetch: false
+    // True while the run currently executing is one the user asked for. Read at
+    // exit to decide whether anybody is waiting for a verdict.
+    property bool forcedRunInFlight: false
+    // "ok" | "fail" | "" - the outcome of the last manual refresh, shown on the
+    // button for a few seconds.
+    property string refreshResult: ""
+    // Drives the spinner on the popout refresh button.
+    readonly property bool refreshing: usageProcess.running
 
     // API usage data
     property string subscriptionType: ""
@@ -39,6 +73,18 @@ PluginComponent {
     property real sevenDayUtil: 0
     property string sevenDayReset: ""
     property bool extraUsageEnabled: false
+    // How much the rate limit numbers above can be trusted. usageError is empty
+    // when the last fetch succeeded; otherwise usageAge is how old the numbers
+    // being shown are, in seconds (0 = there is no data at all).
+    property int usageAge: 0
+    property string usageError: ""
+    // Per-model weekly limits, the rows claude.ai shows under the all-models
+    // one: [{ name, percent }]. Empty when the plan has no scoped model.
+    property var weeklyScoped: []
+    // First day (YYYY-MM-DD, local) of the window the week totals below cover.
+    // It is the rate limit week, which does not start on Monday, so the totals
+    // sit next to the 7-day ring measuring the same days.
+    property string weekWindowStart: ""
 
     // Weekly state
     property int weekMessages: 0
@@ -53,8 +99,11 @@ PluginComponent {
     property int alltimeMessages: 0
     property string firstSession: ""
 
-    // Daily breakdown (rolling 7 days, computed from JSONL files)
+    // The seven days of the rate limit window, in order, computed from JSONL files
     property var dailyTokens: [0, 0, 0, 0, 0, 0, 0]
+    // Counted by date rather than read out of the strip: on the morning of a
+    // reset day, today is not one of the seven days the strip covers.
+    property real todayTokens: 0
 
     // Estimated API cost (in USD)
     property real todayCost: 0
@@ -101,6 +150,35 @@ PluginComponent {
     property string displayFiveHourReset: currentPd && currentPd.fiveHourReset !== undefined ? currentPd.fiveHourReset : fiveHourReset
     property real displaySevenDayUtil: currentPd && currentPd.sevenDayUtil !== undefined ? currentPd.sevenDayUtil : sevenDayUtil
     property string displaySevenDayReset: currentPd && currentPd.sevenDayReset !== undefined ? currentPd.sevenDayReset : sevenDayReset
+    property int displayUsageAge: currentPd && currentPd.usageAge !== undefined ? currentPd.usageAge : usageAge
+    property string displayUsageError: currentPd && currentPd.usageError !== undefined ? currentPd.usageError : usageError
+    property var displayWeeklyScoped: currentPd && currentPd.weeklyScoped !== undefined ? currentPd.weeklyScoped : weeklyScoped
+    property string displayWeekWindowStart: currentPd && currentPd.weekWindowStart !== undefined ? currentPd.weekWindowStart : weekWindowStart
+    // "Since Aug 6" - which days the week totals in this card cover. Empty until
+    // a window is known, so nothing is claimed before the first fetch lands.
+    property string weekWindowLabel: {
+        if (!displayWeekWindowStart)
+            return "";
+        var d = new Date(displayWeekWindowStart + "T00:00:00");
+        if (isNaN(d.getTime()))
+            return "";
+        return tr("Since") + " " + Qt.formatDate(d, "MMM d");
+    }
+
+    // One line telling the user the rate limit numbers are not live, and why.
+    // Empty while the fetch is healthy, which is the normal case.
+    property string usageWarning: {
+        if (!displayUsageError)
+            return "";
+        var reason = usageErrorLabel(displayUsageError);
+        if (displayUsageAge <= 0)
+            return reason;
+        return formatAge(displayUsageAge) + " " + tr("old") + " · " + reason;
+    }
+    // Suffix for every rate limit percentage that came from a failed fetch, so a
+    // number is never presented as live. The reason itself is printed once, in
+    // the 5h card, rather than repeated under each ring.
+    property string staleMark: usageWarning === "" ? "" : "?"
     property real displayWeekTokens: currentPd && currentPd.weekTokens !== undefined ? currentPd.weekTokens : weekTokens
     property int displayWeekMessages: currentPd && currentPd.weekMessages !== undefined ? currentPd.weekMessages : weekMessages
     property int displayWeekSessions: currentPd && currentPd.weekSessions !== undefined ? currentPd.weekSessions : weekSessions
@@ -109,6 +187,7 @@ PluginComponent {
     property real displayWeekCost: currentPd && currentPd.weekCost !== undefined ? currentPd.weekCost : weekCost
     property real displayMonthCost: currentPd && currentPd.monthCost !== undefined ? currentPd.monthCost : monthCost
     property var displayDailyTokens: currentPd && currentPd.daily ? currentPd.daily : dailyTokens
+    property real displayTodayTokens: currentPd && currentPd.todayTokens !== undefined ? currentPd.todayTokens : todayTokens
 
     // Per-profile daily tokens for chart overlay. Empty array when "all" selected.
     property var profileDailyTokens: currentPd && currentPd.daily ? currentPd.daily : []
@@ -164,11 +243,26 @@ PluginComponent {
     // the horizontal and vertical pills so they never diverge.
     readonly property bool pillOverPace: showPacing && (pillFivePace.status === "over" || pillFivePace.status === "over_quota")
 
-    // Today's index in the calendar week (0=Monday, 6=Sunday)
+    // Where today sits in the seven days the strip covers, or -1 when it sits
+    // outside them - which happens between midnight and a reset later the same
+    // day, when the window on screen is still the one about to close.
     property int todayIndex: {
         void (countdownNow);
-        var dow = new Date().getDay(); // 0=Sunday, 6=Saturday
-        return dow === 0 ? 6 : dow - 1;
+        return windowDayIndex(displayWeekWindowStart, new Date());
+    }
+
+    // Column 0..6 of the strip that `when` falls in, or -1 outside the window.
+    // Compares calendar dates, so it never drifts with the time of day.
+    function windowDayIndex(windowStart, when) {
+        var start = new Date(windowStart + "T00:00:00");
+        if (isNaN(start.getTime()))
+            return -1;
+        var day = new Date(when.getFullYear(), when.getMonth(), when.getDate());
+        var diff = day.getTime() - start.getTime();
+        // Both ends are local midnights, so rounding absorbs the 23h and 25h
+        // days that daylight saving produces.
+        var days = Math.round(diff / 86400000);
+        return days >= 0 && days <= 6 ? days : -1;
     }
 
     // Derived
@@ -237,6 +331,51 @@ PluginComponent {
         if (n >= 1000)
             return (n / 1000).toFixed(1) + "K";
         return Math.round(n).toString();
+    }
+
+    // Calendar date of strip column `index`, as "Mon 10 Aug". The strip no longer
+    // starts on Monday, so a bare weekday label is not enough to place a bar.
+    function dayDate(index) {
+        var d = new Date(displayWeekWindowStart + "T00:00:00");
+        if (isNaN(d.getTime()) || index < 0)
+            return "";
+        d.setDate(d.getDate() + index);
+        return Qt.formatDate(d, "ddd d MMM");
+    }
+
+    // Seconds → "45m" / "3h 37m" / "2d 4h". Used for how old stale numbers are.
+    function formatAge(seconds) {
+        if (!(seconds > 0))
+            return "0m";
+        var mins = Math.floor(seconds / 60);
+        if (mins < 60)
+            return mins + "m";
+        var hours = Math.floor(mins / 60);
+        if (hours < 24)
+            return hours + "h " + (mins % 60) + "m";
+        return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
+    }
+
+    function usageErrorLabel(code) {
+        switch (code) {
+        case "token_expired":
+            // The script renews the access token itself, so this only appears
+            // when the refresh token is dead too - and then a `claude` run is
+            // genuinely the only fix. Names it instead of just the fault.
+            return tr("Claude Code login expired - run claude once");
+        case "rate_limited":
+            return tr("API rate limited");
+        case "unauthorized":
+            return tr("Not authorized");
+        case "offline":
+            return tr("No connection");
+        case "no_credentials":
+            return tr("Not signed in");
+        case "bad_response":
+            return tr("Unexpected API response");
+        default:
+            return code;
+        }
     }
 
     function shortModelName(name) {
@@ -426,6 +565,28 @@ PluginComponent {
         }
         return _pd;
     }
+    // "Fable:6,Opus:12" -> [{ name: "Fable", percent: 6 }, ...]. The script strips
+    // `,` `:` `|` from model names, so splitting on them here is safe.
+    function parseScopedLimits(val) {
+        var out = [];
+        if (!val)
+            return out;
+        var entries = val.split(",");
+        for (var i = 0; i < entries.length; i++) {
+            var colon = entries[i].lastIndexOf(":");
+            if (colon <= 0)
+                continue;
+            var name = entries[i].substring(0, colon);
+            var pct = parseFloat(entries[i].substring(colon + 1));
+            if (name === "" || isNaN(pct))
+                continue;
+            out.push({
+                name: name,
+                percent: pct
+            });
+        }
+        return out;
+    }
 
     function parseProfileBool(val, field) {
         var _pd = Object.assign({}, profileData);
@@ -474,6 +635,18 @@ PluginComponent {
         case "EXTRA_USAGE_ENABLED":
             extraUsageEnabled = (val === "true");
             break;
+        case "USAGE_AGE":
+            usageAge = parseInt(val) || 0;
+            break;
+        case "USAGE_ERROR":
+            usageError = val;
+            break;
+        case "WEEKLY_SCOPED":
+            weeklyScoped = parseScopedLimits(val);
+            break;
+        case "WEEK_WINDOW_START":
+            weekWindowStart = val;
+            break;
         case "WEEK_MESSAGES":
             weekMessages = parseInt(val) || 0;
             break;
@@ -485,6 +658,9 @@ PluginComponent {
             break;
         case "MONTH_TOKENS":
             monthTokens = parseFloat(val) || 0;
+            break;
+        case "TODAY_TOKENS":
+            todayTokens = parseFloat(val) || 0;
             break;
         case "ALLTIME_SESSIONS":
             alltimeSessions = parseInt(val) || 0;
@@ -565,6 +741,9 @@ PluginComponent {
         case "PROFILE_MONTH_TOKENS":
             profileData = parseProfileSimple(val, "monthTokens", false);
             break;
+        case "PROFILE_TODAY_TOKENS":
+            profileData = parseProfileSimple(val, "todayTokens", false);
+            break;
         case "PROFILE_WEEK_MESSAGES":
             profileData = parseProfileSimple(val, "weekMessages", false);
             break;
@@ -601,6 +780,35 @@ PluginComponent {
         case "PROFILE_EXTRA_USAGE":
             profileData = parseProfileBool(val, "extraUsageEnabled");
             break;
+        case "PROFILE_USAGE_AGE":
+            profileData = parseProfileSimple(val, "usageAge", false);
+            break;
+        case "PROFILE_USAGE_ERROR":
+            profileData = parseProfileString(val, "usageError");
+            break;
+        case "PROFILE_WEEK_WINDOW_START":
+            profileData = parseProfileString(val, "weekWindowStart");
+            break;
+        case "PROFILE_WEEKLY_SCOPED":
+            {
+                // Pipe-separated because the value itself holds `Model:percent`
+                // pairs joined by commas, same shape as PROFILE_WEEK_MODELS.
+                var _pd4 = Object.assign({}, profileData);
+                var blocks4 = val.split("|");
+                for (var bi4 = 0; bi4 < blocks4.length; bi4++) {
+                    var c4 = blocks4[bi4].indexOf(":");
+                    if (c4 < 0)
+                        continue;
+                    var pname4 = blocks4[bi4].substring(0, c4);
+                    if (!_pd4[pname4])
+                        _pd4[pname4] = {};
+                    else
+                        _pd4[pname4] = Object.assign({}, _pd4[pname4]);
+                    _pd4[pname4].weeklyScoped = parseScopedLimits(blocks4[bi4].substring(c4 + 1));
+                }
+                profileData = _pd4;
+                break;
+            }
         case "PROFILE_DAILY":
             {
                 var _pd1 = Object.assign({}, profileData);
@@ -687,13 +895,26 @@ PluginComponent {
 
     // --- Data fetching ---
 
-    // Pick up an added/removed profile now instead of waiting for the refresh timer
-    onCustomProfilesChanged: {
+    // Start a run now, or queue one when a run is already in flight.
+    function rerun() {
         if (usageProcess.running)
-            customProfilesRefreshPending = true;
+            rerunPending = true;
         else
             usageProcess.running = true;
     }
+
+    // Manual refresh from the popout header. Skips the script's usage cache, so
+    // it is also the way out of a stale warning once the login is fixed - the
+    // refresh interval can be 15 minutes, which is a long time to stare at a
+    // warning you have already dealt with.
+    function refreshNow() {
+        refreshResult = "";
+        forceFetch = true;
+        rerun();
+    }
+
+    // Pick up an added/removed profile now instead of waiting for the refresh timer
+    onCustomProfilesChanged: rerun()
 
     Process {
         id: usageProcess
@@ -701,11 +922,23 @@ PluginComponent {
         // while `running` is true, so a single run that never exits (a hung
         // `claude --version`, a stalled curl/find) freezes the widget on stale
         // values until the plugin is reloaded. Killing the run lets onExited fire.
-        command: ["timeout", "120", "bash", root.scriptPath].concat(root.customProfiles.filter(p => p && p.name && p.path).map(p => p.name + "=" + p.path))
+        // `--force` makes the script skip its usage cache TTL, so the manual
+        // refresh actually refetches instead of replaying the same cached
+        // response. Profile arguments are `name=path`, never a bare flag.
+        command: ["timeout", "120", "bash", root.scriptPath].concat(root.forceFetch ? ["--force"] : []).concat(root.countBridged ? [] : ["--no-bridged"]).concat(root.customProfiles.filter(p => p && p.name && p.path).map(p => p.name + "=" + p.path))
         running: false
 
         stdout: SplitParser {
             onRead: data => root.parseLine(data.trim())
+        }
+
+        // A forced run is the only one a user is waiting on, so its outcome is
+        // reported on the button. Without this a click that ends in the same
+        // numbers - the usual case when the login is dead - looks like a button
+        // that does nothing.
+        onRunningChanged: {
+            if (running)
+                root.forcedRunInFlight = root.forceFetch;
         }
 
         onExited: (exitCode, exitStatus) => {
@@ -713,14 +946,33 @@ PluginComponent {
                 root.isLoading = false;
                 root.refreshEpoch++;
             }
-            if (root.customProfilesRefreshPending) {
-                root.customProfilesRefreshPending = false;
+            if (root.forcedRunInFlight) {
+                root.forcedRunInFlight = false;
+                root.refreshResult = (exitCode === 0 && root.usageError === "") ? "ok" : "fail";
+                refreshResultTimer.restart();
+            }
+            // A run requested while another was in flight is honoured now. The
+            // force flag survives until the run that was asked for has started,
+            // otherwise a manual refresh queued behind a timer tick would lose it.
+            if (root.rerunPending) {
+                root.rerunPending = false;
                 Qt.callLater(function() {
                     if (!usageProcess.running)
                         usageProcess.running = true;
                 });
+            } else {
+                root.forceFetch = false;
             }
         }
+    }
+
+    // Lives on the widget, not in the popout: the popout may be closed before a
+    // slow run finishes, and a dangling timer in a destroyed component would
+    // leave refreshResult set forever.
+    Timer {
+        id: refreshResultTimer
+        interval: 3000
+        onTriggered: root.refreshResult = ""
     }
 
     Timer {
@@ -739,6 +991,9 @@ PluginComponent {
     horizontalBarPill: Component {
         Row {
             spacing: Theme.spacingXS
+            // Dimmed with a "?" suffix while the numbers are not live, so the bar
+            // never states a percentage it cannot back up. Details in the popout.
+            opacity: root.usageError !== "" ? 0.6 : 1
 
             Canvas {
                 id: hRing
@@ -775,9 +1030,9 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.fiveHourUtil) + "%" + (root.usageError !== "" ? "?" : (root.pillOverPace ? " ↑" : ""))
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
-                color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
+                color: root.usageError === "" && root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
                 anchors.verticalCenter: parent.verticalCenter
             }
         }
@@ -786,6 +1041,7 @@ PluginComponent {
     verticalBarPill: Component {
         Column {
             spacing: Theme.spacingXS || 4
+            opacity: root.usageError !== "" ? 0.6 : 1
 
             Canvas {
                 id: vRing
@@ -822,9 +1078,9 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.fiveHourUtil) + "%" + (root.usageError !== "" ? "?" : (root.pillOverPace ? " ↑" : ""))
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
-                color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
+                color: root.usageError === "" && root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
                 anchors.horizontalCenter: parent.horizontalCenter
             }
         }
@@ -976,6 +1232,56 @@ PluginComponent {
             }
             showCloseButton: true
 
+            // Manual refresh, styled after the close button next to it. Spins
+            // while a run is in flight, which is also the only feedback that a
+            // click did anything when the numbers come back unchanged.
+            headerActions: Component {
+                Rectangle {
+                    width: 32
+                    height: 32
+                    radius: 16
+                    color: refreshArea.containsMouse ? Theme.withAlpha(Theme.primary, 0.12) : "transparent"
+
+                    DankIcon {
+                        id: refreshIcon
+                        anchors.centerIn: parent
+                        // The icon carries the verdict for a few seconds: a check
+                        // when the numbers are live again, an error mark when the
+                        // fetch failed and the warning below still stands.
+                        name: root.refreshResult === "ok" ? "check" : root.refreshResult === "fail" ? "error" : "refresh"
+                        size: Theme.iconSize - 4
+                        color: {
+                            if (root.refreshResult === "fail")
+                                return Theme.error;
+                            if (root.refreshResult === "ok")
+                                return Theme.primary;
+                            return refreshArea.containsMouse ? Theme.primary : Theme.surfaceVariantText;
+                        }
+
+                        RotationAnimator {
+                            target: refreshIcon
+                            from: 0
+                            to: 360
+                            duration: 1000
+                            loops: Animation.Infinite
+                            running: root.refreshing
+                            onRunningChanged: {
+                                if (!running)
+                                    refreshIcon.rotation = 0;
+                            }
+                        }
+                    }
+
+                    MouseArea {
+                        id: refreshArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.refreshNow()
+                    }
+                }
+            }
+
             Column {
                 width: parent.width - Theme.spacingM * 2
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -1048,7 +1354,7 @@ PluginComponent {
 
                             StyledText {
                                 anchors.centerIn: parent
-                                text: Math.round(root.displayFiveHourUtil) + "%"
+                                text: Math.round(root.displayFiveHourUtil) + "%" + root.staleMark
                                 font.pixelSize: Theme.fontSizeXLarge
                                 font.weight: Font.DemiBold
                                 color: Theme.surfaceText
@@ -1070,7 +1376,7 @@ PluginComponent {
                             }
                             StyledText {
                                 width: parent.width
-                                text: Math.round(root.displayFiveHourUtil) + "% " + root.tr("used")
+                                text: Math.round(root.displayFiveHourUtil) + "%" + root.staleMark + " " + root.tr("used")
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: root.progressColor(root.displayFiveHourUtil)
                                 wrapMode: Text.WordWrap
@@ -1078,7 +1384,7 @@ PluginComponent {
                             StyledText {
                                 width: parent.width
                                 text: root.paceLabel(root.fiveHourPace)
-                                visible: root.showPacing && text !== ""
+                                visible: root.showPacing && root.usageWarning === "" && text !== ""
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: root.paceColor(root.fiveHourPace.status)
                                 wrapMode: Text.WordWrap
@@ -1088,7 +1394,18 @@ PluginComponent {
                                 text: root.displayFiveHourCountdown ? root.tr("Resets in") + " " + root.displayFiveHourCountdown : ""
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: Theme.surfaceVariantText
-                                visible: root.displayFiveHourCountdown !== ""
+                                // Hidden while the numbers are not live: the reset time comes
+                                // from the same stale response, so it counts down to an instant
+                                // that has already passed and reads "Resetting..." forever.
+                                visible: root.usageWarning === "" && root.displayFiveHourCountdown !== ""
+                                wrapMode: Text.WordWrap
+                            }
+                            StyledText {
+                                width: parent.width
+                                text: root.usageWarning
+                                visible: root.usageWarning !== ""
+                                font.pixelSize: Theme.fontSizeMedium
+                                color: Theme.error
                                 wrapMode: Text.WordWrap
                             }
                         }
@@ -1145,7 +1462,7 @@ PluginComponent {
 
                             StyledText {
                                 anchors.centerIn: parent
-                                text: Math.round(root.displaySevenDayUtil) + "%"
+                                text: Math.round(root.displaySevenDayUtil) + "%" + root.staleMark
                                 font.pixelSize: 14
                                 font.weight: Font.DemiBold
                                 color: Theme.surfaceText
@@ -1159,16 +1476,30 @@ PluginComponent {
 
                             StyledText {
                                 width: parent.width
-                                text: root.tr("7-Day Usage") + " · " + Math.round(root.displaySevenDayUtil) + "%"
+                                text: root.tr("7-Day Usage") + " · " + Math.round(root.displaySevenDayUtil) + "%" + root.staleMark
                                 font.pixelSize: Theme.fontSizeMedium
                                 font.weight: Font.Medium
                                 color: Theme.surfaceText
                                 wrapMode: Text.WordWrap
                             }
+                            // One row per model that has its own weekly cap. The
+                            // all-models ring can sit at 71% while a single model
+                            // is at 6%, so these are not derivable from it.
+                            Repeater {
+                                model: root.displayWeeklyScoped
+                                StyledText {
+                                    required property var modelData
+                                    width: parent.width
+                                    text: modelData.name + " · " + Math.round(modelData.percent) + "%" + root.staleMark
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: root.progressColor(modelData.percent)
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
                             StyledText {
                                 width: parent.width
                                 text: root.paceLabel(root.sevenDayPace)
-                                visible: root.showPacing && text !== ""
+                                visible: root.showPacing && root.usageWarning === "" && text !== ""
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: root.paceColor(root.sevenDayPace.status)
                                 wrapMode: Text.WordWrap
@@ -1181,6 +1512,8 @@ PluginComponent {
                                         parts.push(root.displayWeekSessions + " " + root.tr("sessions"));
                                     if (root.displayWeekMessages > 0)
                                         parts.push(root.displayWeekMessages + " " + root.tr("msgs"));
+                                    if (root.weekWindowLabel !== "")
+                                        parts.push(root.weekWindowLabel);
                                     return parts.join(" · ");
                                 }
                                 font.pixelSize: Theme.fontSizeSmall
@@ -1193,7 +1526,7 @@ PluginComponent {
                                 text: root.displaySevenDayCountdown ? root.tr("Resets in") + " " + root.displaySevenDayCountdown : ""
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
-                                visible: root.displaySevenDayCountdown !== ""
+                                visible: root.usageWarning === "" && root.displaySevenDayCountdown !== ""
                                 wrapMode: Text.WordWrap
                             }
                         }
@@ -1233,7 +1566,7 @@ PluginComponent {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                                 StyledText {
-                                    text: root.formatTokens(root.displayDailyTokens[root.todayIndex])
+                                    text: root.formatTokens(root.displayTodayTokens)
                                     font.pixelSize: Theme.fontSizeLarge
                                     font.weight: Font.DemiBold
                                     color: Theme.primary
@@ -1427,6 +1760,15 @@ PluginComponent {
                             id: tooltipCol
                             anchors.centerIn: parent
                             spacing: 1
+
+                            // Line 0: which day this bar is, since the strip can
+                            // start on any weekday
+                            StyledText {
+                                text: root.dayDate(root.hoveredDay)
+                                font.pixelSize: 10
+                                color: Theme.surfaceVariantText
+                                anchors.horizontalCenter: parent.horizontalCenter
+                            }
 
                             // Line 1: total tokens (with "total" suffix when a profile is selected)
                             StyledText {

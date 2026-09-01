@@ -11,13 +11,48 @@ USAGE_CACHE="${CLAUDE_DIR}/usage-cache.json"
 USAGE_CACHE_TTL=90  # seconds, below the 2 min minimum refresh interval
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
+# `--force` (manual refresh from the popout) skips the usage cache TTL, so a
+# user who just fixed a dead login sees it immediately instead of waiting for
+# the cache to age out. Profile arguments are `name=path`, so a bare flag can
+# never collide with one.
+FORCE_FETCH=false
+# Claude Code is not the only client that spends this subscription: a bridge like
+# cliproxyapi lets other agent harnesses (pi, and anything else pointed at it)
+# talk to the same account, and those calls never touch ~/.claude/projects. With
+# only Claude Code transcripts counted, a day spent entirely in such a client
+# reads as "today 0 tokens" under a 5h ring that says 16% used. So their
+# transcripts are counted too, unless `--no-bridged` asks us not to.
+COUNT_BRIDGED=true
+for arg in "$@"; do
+    [ "$arg" = "--force" ] && FORCE_FETCH=true
+    [ "$arg" = "--no-bridged" ] && COUNT_BRIDGED=false
+done
+
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
 TODAY=$(date +%Y-%m-%d)
-# Calendar week: Monday to Sunday
+# Calendar week: Monday to Sunday. The fallback week for every "week" total, and
+# for the Daily Activity strip, when the API never answered and there is no rate
+# limit window to align to.
 DOW=$(date +%u)  # 1=Monday, 7=Sunday
 WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
 # Calendar month: 1st of current month
 MONTH_START=$(date +%Y-%m-01)
+
+# The rate limit week does not start on Monday: `seven_day.resets_at` lands on a
+# fixed weekday (Thursday here), so the window that the 7-day ring measures is
+# the seven days before it. Totals labelled "week" have to use that window, or
+# the popout puts session counts, token totals and the model card from a Monday
+# week next to a ring from a Thursday one - on a Monday that reads as if the
+# whole 71% came from the one model used today.
+# Bucketing is date-granular everywhere in this script, so take the local date
+# of the boundary and accept that a few hours of its first day ride along.
+limit_week_start() {
+    local resets_at="$1" ws
+    [ -n "$resets_at" ] || return 1
+    ws=$(date -d "$resets_at - 7 days" +%Y-%m-%d 2>/dev/null) || return 1
+    [[ "$ws" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    printf '%s' "$ws"
+}
 
 # Defaults
 SUBSCRIPTION_TYPE="unknown"
@@ -27,6 +62,10 @@ FIVE_HOUR_RESET=""
 SEVEN_DAY_UTIL=0
 SEVEN_DAY_RESET=""
 EXTRA_USAGE_ENABLED="false"
+USAGE_AGE=0
+USAGE_ERROR=""
+WEEKLY_SCOPED=""
+WEEK_WINDOW_START="$WEEK_START"
 
 WEEK_TOKENS=0
 WEEK_MESSAGES=0
@@ -34,6 +73,7 @@ WEEK_SESSIONS=0
 MONTH_TOKENS=0
 WEEK_MODELS=""
 DAILY="0,0,0,0,0,0,0"
+TODAY_TOKENS=0
 
 TODAY_COST="0.00"
 WEEK_COST="0.00"
@@ -122,20 +162,20 @@ else
     JQ_DATE_EXPR='(if ($ts | length) >= 10 then $ts[:10] else "1970-01-01" end)'
 fi
 
-# --- Per-profile token counting ---
-# Usage: count_profile_tokens <projects_dir> <tmpfile>
-# Writes WEEK_TOKENS=N, WEEK_MESSAGES=N, ... to tmpfile
-count_profile_tokens() {
-    local proj_dir="$1"
-    local out_file="$2"
+# --- Transcript record streams ---
+# Every producer below emits the same eight-field record, and the awk pass in
+# count_profile_tokens is the only thing that knows what to do with it:
+#
+#   <local date> <model> <input> <output> <cache read> <cache write> <session> <cost>
+#
+# `cost` is -1 when the transcript does not price the call itself, meaning "price
+# this from the litellm table". Claude Code transcripts always say -1; harnesses
+# that record their own cost (pi does) hand it over, which is the only way to
+# cost a model the pricing table has never heard of.
 
-    # Day dates for the calendar week (same logic as outer scope)
-    local day_dates=""
-    for i in $(seq 0 6); do
-        local d
-        d=$(date -d "$WEEK_START + ${i} days" +%Y-%m-%d)
-        day_dates="${day_dates:+${day_dates},}${d}"
-    done
+# emit_claude_records <projects_dir>
+emit_claude_records() {
+    local proj_dir="$1"
 
     find "$proj_dir" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
         | jq -r -R 'fromjson? | select(.type == "assistant")
@@ -146,8 +186,89 @@ count_profile_tokens() {
             # fails or jq lacks strflocaltime (see JQ_DATE_EXPR probe above).
             | (.timestamp // "") as $ts
             | ('"$JQ_DATE_EXPR"') as $d
-            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
-        | awk -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
+            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") -1"'
+}
+
+# Where the bridged harnesses keep their transcripts. pi is the one that exists
+# today: `~/.pi/agent/sessions/<cwd>/<stamp>_<id>.jsonl`, plus one such tree per
+# named profile. PI_CONFIG_DIR moves the lot, so honour it.
+BRIDGED_ROOTS=()
+if [ "$COUNT_BRIDGED" = true ]; then
+    pi_home="${PI_CONFIG_DIR:-${HOME}/.pi}"
+    if [ -d "$pi_home" ]; then
+        for bridged_dir in "${pi_home}/agent/sessions" "${pi_home}"/profiles/*/sessions; do
+            [ -d "$bridged_dir" ] && BRIDGED_ROOTS+=("$bridged_dir")
+        done
+    fi
+    unset pi_home bridged_dir
+fi
+
+# emit_bridged_records
+# Only Claude models count: the same harness also drives Gemini and GPT, and
+# those tokens are nobody's Claude subscription. One jq per file because pi keeps
+# the session id in the filename (`<stamp>_<uuid>.jsonl`) and not in the records;
+# ids are prefixed so they can never collide with a Claude Code session uuid.
+emit_bridged_records() {
+    local root file sid
+
+    [ "${#BRIDGED_ROOTS[@]}" -gt 0 ] || return 0
+
+    for root in "${BRIDGED_ROOTS[@]}"; do
+        while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            sid="${file##*/}"
+            sid="${sid%.jsonl}"
+            sid="bridged:${sid##*_}"
+            jq -r -R --arg sid "$sid" 'fromjson? | select(.type == "message")
+                # The envelope timestamp is the one always present; the message
+                # carries its own copy for most record kinds.
+                | ((.timestamp // .message.timestamp // "")) as $ts
+                | ('"$JQ_DATE_EXPR"') as $d
+                | (.message // {})
+                | select(.role == "assistant")
+                | (.model // "unknown") as $m
+                | select($m | test("claude"; "i"))
+                | (.usage // {}) as $u
+                | "\($d) \($m) \($u.input // 0) \($u.output // 0) \($u.cacheRead // 0) \($u.cacheWrite // 0) \($sid) \($u.cost.total // -1)"' \
+                "$file" 2>/dev/null || true
+        done < <(find "$root" -name "*.jsonl" -mtime -31 2>/dev/null)
+    done
+}
+
+# --- Per-profile token counting ---
+# Usage: count_profile_tokens <projects_dir> <tmpfile> [week_start] [count_bridged]
+# Writes WEEK_TOKENS=N, WEEK_MESSAGES=N, ... to tmpfile
+#
+# `week_start` is the first day of the window the week totals cover - the rate
+# limit week when the API told us where it starts, the calendar week otherwise.
+# The Daily Activity strip covers the same seven days, so its bars add up to the
+# week total printed above them, and its labels are derived from this date rather
+# than fixed, because the window can start on any weekday. The one exception is
+# the morning of a reset day: the window's seventh day is yesterday, while the
+# hours since midnight still count toward the window that is about to close, so
+# today rides along in the totals without a bar. TODAY_TOKENS is counted by date
+# for exactly that reason.
+count_profile_tokens() {
+    local proj_dir="$1"
+    local out_file="$2"
+    local week_start="${3:-$WEEK_START}"
+    # Bridged transcripts carry no profile of their own, so they belong to the
+    # login whose rate limit rings the popout shows: the default profile.
+    local count_bridged="${4:-false}"
+
+    # The seven days of that window, in order, for the Daily Activity strip
+    local day_dates=""
+    for i in $(seq 0 6); do
+        local d
+        d=$(date -d "$week_start + ${i} days" +%Y-%m-%d)
+        day_dates="${day_dates:+${day_dates},}${d}"
+    done
+
+    {
+        emit_claude_records "$proj_dir"
+        [ "$count_bridged" = true ] && emit_bridged_records
+    } \
+        | awk -v week_start="$week_start" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
         BEGIN {
             split(day_dates, dates, ",")
             has_pricing = 0
@@ -167,10 +288,22 @@ count_profile_tokens() {
             date = $1; model = $2
             inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
             sess = $7
+            rec_cost = ($8 == "") ? -1 : $8 + 0
             total = inp + out + cr + cw
 
-            n_parts = split(model, mparts, "-")
-            family = (n_parts >= 3 && mparts[1] == "claude") ? mparts[2] : model
+            # Model ids arrive decorated depending on how Claude Code reaches the
+            # model: a proxy or Vertex publisher prefix ("cliproxy/claude-opus-5"),
+            # a Bedrock region/vendor prefix and version suffix
+            # ("us.anthropic.claude-sonnet-4-5-20250929-v1:0"), or a Vertex date
+            # suffix ("claude-sonnet-4-5@20250929"). Strip the decoration before
+            # deriving the family, otherwise the same model bills and charts as
+            # several distinct rows and never matches the pricing table.
+            id = model
+            sub("^[^/]+/", "", id)
+            sub("^([a-z]+\\.)+", "", id)
+            sub("[:@].*$", "", id)
+            n_parts = split(id, mparts, "-")
+            family = (n_parts >= 3 && mparts[1] == "claude") ? mparts[2] : id
 
             day[date] += total
             if (date >= week_start) {
@@ -181,8 +314,17 @@ count_profile_tokens() {
             }
             if (date >= month_start) month_tokens += total
 
-            if (has_pricing && (family in price_in)) {
+            # A cost the transcript computed itself wins: it priced the exact
+            # model that answered, including ones the litellm table has never
+            # heard of, where the table lookup below finds nothing and the call
+            # would otherwise cost zero.
+            cost = -1
+            if (rec_cost >= 0) {
+                cost = rec_cost
+            } else if (has_pricing && (family in price_in)) {
                 cost = inp * price_in[family] + out * price_out[family] + cr * price_cr[family] + cw * price_cw[family]
+            }
+            if (cost >= 0) {
                 day_cost[date] += cost
                 if (date >= week_start) week_cost += cost
                 if (date >= month_start) month_cost += cost
@@ -194,6 +336,10 @@ count_profile_tokens() {
             n = 0; for (s in week_sess) n++
             printf "WEEK_SESSIONS=%d\n", n
             printf "MONTH_TOKENS=%d\n", month_tokens + 0
+            # Today never depends on where it lands in the strip: during the few
+            # hours between midnight and a reset later the same day, today is not
+            # one of the seven window days at all.
+            printf "TODAY_TOKENS=%d\n", (today in day) ? day[today] : 0
 
             daily = ""
             for (i = 1; i <= 7; i++) {
@@ -226,10 +372,201 @@ count_profile_tokens() {
         }' > "$out_file" 2>/dev/null || true
 }
 
+# --- OAuth token refresh ---
+# The access token in `.credentials.json` lives ~12h. Claude Code renews it when
+# it runs, so a user whose daily driver is Claude Code never notices. For everyone
+# else the token dies and every usage fetch from here on is refused, which froze
+# this widget on hours-old numbers. So do the refresh ourselves: the endpoint,
+# client id and body below are exactly what Claude Code 2.1.x sends (`TOKEN_URL`,
+# `CLIENT_ID` and its `grant_type=refresh_token` call in its own bundle).
+OAUTH_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_SCOPES="user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+# Not `claude-code/<version>`: that exact string is throttled at the edge of the
+# token endpoint (measured: HTTP 429 in 20ms before the grant is even looked at,
+# while any other agent string gets a real answer). We are not Claude Code, so we
+# say who we are.
+OAUTH_USER_AGENT="dms-claudecode"
+# How long a failed refresh is left alone. The widget fetches every 2 minutes, so
+# without this a permanently dead refresh token would hammer the endpoint forever.
+REFRESH_BACKOFF=600  # seconds
+
+# Usage: refresh_oauth_token <credentials_file> <backoff_stamp_file>
+# Echoes a usable access token and returns 0, or returns 1 and prints nothing.
+# A failure leaves `<epoch> <http_code>` in the stamp file: the epoch gates the
+# retry, the code lets the caller say "rate limited" instead of "log in again".
+#
+# This is the one place the plugin writes a file it does not own, so it is
+# deliberately timid: the credentials file is replaced only when the response
+# parsed completely AND nobody rotated the refresh token while the request was in
+# flight. A half-written credentials file breaks the user's Claude Code login,
+# which is far worse than a widget showing stale numbers.
+refresh_oauth_token() {
+    local creds_file="$1" stamp_file="$2"
+    local now_ts refresh_token refresh_exp stamp scopes raw http_code body
+    local access_token new_refresh expires_in refresh_expires_in
+    local expires_ms refresh_expires_ms current_refresh other_token tmp_file
+
+    now_ts=$(date +%s)
+
+    refresh_token=$(jq -r '.claudeAiOauth.refreshToken // ""' "$creds_file" 2>/dev/null | head -1)
+    [ -n "$refresh_token" ] || return 1
+
+    # An expired refresh token can only be replaced by `claude auth login`, and
+    # spending a request to be told that helps nobody.
+    refresh_exp=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // 0' "$creds_file" 2>/dev/null | head -1)
+    [[ "$refresh_exp" =~ ^[0-9]+$ ]] || refresh_exp=0
+    if [ "$refresh_exp" -gt 0 ] && [ $(( refresh_exp / 1000 )) -le "$now_ts" ]; then
+        return 1
+    fi
+
+    if [ -f "$stamp_file" ]; then
+        stamp=$(awk 'NR==1 {print $1}' "$stamp_file" 2>/dev/null || echo 0)
+        [[ "$stamp" =~ ^[0-9]+$ ]] || stamp=0
+        if [ $(( now_ts - stamp )) -lt "$REFRESH_BACKOFF" ]; then
+            return 1
+        fi
+    fi
+
+    # Ask for the scopes the login already has; the hardcoded list is only a
+    # fallback for a credentials file written before scopes were stored.
+    scopes=$(jq -r '(.claudeAiOauth.scopes // []) | join(" ")' "$creds_file" 2>/dev/null | head -1)
+    [ -n "$scopes" ] || scopes="$OAUTH_SCOPES"
+
+    raw=$(curl -s -w '\n%{http_code}' --max-time 15 -X POST \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        -H "User-Agent: ${OAUTH_USER_AGENT}" \
+        -d "$(jq -nc --arg rt "$refresh_token" --arg cid "$OAUTH_CLIENT_ID" --arg scope "$scopes" \
+                '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid, scope: $scope}')" \
+        "$OAUTH_TOKEN_URL" 2>/dev/null) || raw=""
+
+    http_code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=000
+
+    access_token=""; new_refresh=""; expires_in=0; refresh_expires_in=0
+    if [ "$http_code" = 200 ]; then
+        access_token=$(echo "$body" | jq -r '.access_token // ""' 2>/dev/null | head -1)
+        new_refresh=$(echo "$body" | jq -r '.refresh_token // ""' 2>/dev/null | head -1)
+        expires_in=$(echo "$body" | jq -r '.expires_in // 0' 2>/dev/null | head -1)
+        refresh_expires_in=$(echo "$body" | jq -r '.refresh_token_expires_in // 0' 2>/dev/null | head -1)
+    fi
+    [[ "$expires_in" =~ ^[0-9]+$ ]] || expires_in=0
+    [[ "$refresh_expires_in" =~ ^[0-9]+$ ]] || refresh_expires_in=0
+
+    if [ -z "$access_token" ] || [ "$expires_in" -le 0 ]; then
+        printf '%s %s\n' "$now_ts" "$http_code" > "$stamp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # The server rotates the refresh token on use, so an omitted one means "keep
+    # the old one", not "drop it".
+    [ -n "$new_refresh" ] || new_refresh="$refresh_token"
+    expires_ms=$(( (now_ts + expires_in) * 1000 ))
+    refresh_expires_ms=0
+    [ "$refresh_expires_in" -gt 0 ] && refresh_expires_ms=$(( (now_ts + refresh_expires_in) * 1000 ))
+
+    # Claude Code, or a parallel run of this script, may have refreshed while our
+    # request was in flight. Their token is as good as ours and the server has
+    # already retired the one we sent, so take theirs and leave the file alone.
+    current_refresh=$(jq -r '.claudeAiOauth.refreshToken // ""' "$creds_file" 2>/dev/null | head -1)
+    if [ "$current_refresh" != "$refresh_token" ]; then
+        other_token=$(jq -r '.claudeAiOauth.accessToken // ""' "$creds_file" 2>/dev/null | head -1)
+        [ -n "$other_token" ] || return 1
+        rm -f "$stamp_file" 2>/dev/null || true
+        printf '%s\n' "$other_token"
+        return 0
+    fi
+
+    # Merge, never rewrite: the file carries keys this script does not know about
+    # (`mcpOAuth`, subscription details) and losing them would break the login.
+    # `umask 077` keeps the 0600 mode across the rename.
+    tmp_file="${creds_file}.$$.tmp"
+    if ! ( umask 077; jq --arg at "$access_token" --arg rt "$new_refresh" \
+            --argjson exp "$expires_ms" --argjson rexp "$refresh_expires_ms" \
+            --arg scope "$(echo "$body" | jq -r '.scope // ""' 2>/dev/null | head -1)" '
+            .claudeAiOauth.accessToken = $at
+            | .claudeAiOauth.refreshToken = $rt
+            | .claudeAiOauth.expiresAt = $exp
+            | if $rexp > 0 then .claudeAiOauth.refreshTokenExpiresAt = $rexp else . end
+            | if ($scope | length) > 0 then .claudeAiOauth.scopes = ($scope | split(" ")) else . end
+        ' "$creds_file" > "$tmp_file" 2>/dev/null ); then
+        rm -f "$tmp_file"
+        printf '%s %s\n' "$now_ts" "$http_code" > "$stamp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # Verify the merge landed before overwriting a working login: a truncated or
+    # empty temp file would otherwise become the user's credentials.
+    if ! jq -e --arg at "$access_token" '.claudeAiOauth.accessToken == $at' "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        printf '%s %s\n' "$now_ts" "$http_code" > "$stamp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    mv -f "$tmp_file" "$creds_file" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
+    rm -f "$stamp_file" 2>/dev/null || true
+    printf '%s\n' "$access_token"
+}
+
+# Why did the usage fetch fail? Short stable tokens, the widget maps them to text.
+# Usage: classify_usage_error <credentials_file> <now_epoch> <http_code> [refresh_stamp]
+# An expired OAuth token wins over the HTTP code: it is the cause the user can act
+# on. The script refreshes the token itself (see `refresh_oauth_token`), so seeing
+# this reason means even the refresh could not save it - the refresh token is gone
+# too, and only `claude` running once will fix the login. Unless the refresh was
+# throttled rather than refused: then the login is fine and the advice would be
+# wrong, so the stamp's HTTP code overrides it.
+classify_usage_error() {
+    local creds_file="$1" now_ts="$2" http_code="$3" refresh_stamp="${4:-}"
+    local expires_ms refresh_code
+
+    expires_ms=$(jq -r '.claudeAiOauth.expiresAt // 0' "$creds_file" 2>/dev/null | head -1)
+    [[ "$expires_ms" =~ ^[0-9]+$ ]] || expires_ms=0
+    if [ "$expires_ms" -gt 0 ] && [ $(( expires_ms / 1000 )) -le "$now_ts" ]; then
+        refresh_code=""
+        if [ -n "$refresh_stamp" ] && [ -f "$refresh_stamp" ]; then
+            refresh_code=$(awk 'NR==1 {print $2}' "$refresh_stamp" 2>/dev/null || echo "")
+        fi
+        if [ "$refresh_code" = 429 ]; then
+            echo "rate_limited"
+        else
+            echo "token_expired"
+        fi
+        return
+    fi
+
+    case "$http_code" in
+        000) echo "offline" ;;
+        401|403) echo "unauthorized" ;;
+        429) echo "rate_limited" ;;
+        2*) echo "bad_response" ;;
+        *) echo "http_${http_code}" ;;
+    esac
+}
+
 # --- Per-profile credentials + API usage fetcher ---
+# Every exit path emits the same field set, so one emitter owns the format and
+# the field order. Arguments, in order: out_file, subscription type, rate limit
+# tier, 5h utilization, 5h reset, 7d utilization, 7d reset, extra usage flag,
+# usage age, usage error, scoped weekly limits.
+write_usage_fields() {
+    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nUSAGE_AGE=%s\nUSAGE_ERROR=%s\nWEEKLY_SCOPED=%s\n' \
+        "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}" "${9}" "${10}" "${11}" > "$1"
+}
+
 # Usage: fetch_profile_usage <credentials_file> <cache_file> <out_tmpfile>
 # Writes SUBSCRIPTION_TYPE, RATE_LIMIT_TIER, FIVE_HOUR_UTIL, FIVE_HOUR_RESET,
-#        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED to out_tmpfile
+#        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED, USAGE_AGE,
+#        USAGE_ERROR, WEEKLY_SCOPED to out_tmpfile
+#
+# USAGE_AGE/USAGE_ERROR describe how trustworthy the rate limit numbers are:
+#   USAGE_AGE=0   USAGE_ERROR=            fetched now, or cache still within TTL
+#   USAGE_AGE=N   USAGE_ERROR=<reason>    fetch failed, serving cache N seconds old
+#   USAGE_AGE=0   USAGE_ERROR=<reason>    fetch failed and no cache, numbers are 0
+# Without them a failed fetch is indistinguishable from a real reading, so the
+# widget shows hours-old numbers as if they were live.
 fetch_profile_usage() {
     local creds_file="$1"
     local cache_file="$2"
@@ -238,10 +575,12 @@ fetch_profile_usage() {
     local sub_type="unknown"
     local tier="unknown"
     local five_util=0 five_reset="" seven_util=0 seven_reset="" extra="false"
+    local usage_age=0 usage_error="" scoped=""
 
     if [ ! -f "$creds_file" ]; then
-        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\n' \
-            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" > "$out_file"
+        usage_error="no_credentials"
+        write_usage_fields "$out_file" "$sub_type" "$tier" "$five_util" "$five_reset" \
+            "$seven_util" "$seven_reset" "$extra" "$usage_age" "$usage_error" "$scoped"
         return
     fi
 
@@ -251,8 +590,11 @@ fetch_profile_usage() {
     # Check cache freshness
     local api_resp="{}"
     local use_cache=false cache_matches=false
+    local cache_age=0
+    local now_ts
+    now_ts=$(date +%s)
     if [ -f "$cache_file" ]; then
-        local cache_identity cache_ts now_ts age
+        local cache_identity cache_ts
         cache_identity=$(jq -r '.identity // ""' "$cache_file" 2>/dev/null | head -1)
         [ "$cache_identity" = "$creds_file" ] && cache_matches=true
 
@@ -262,24 +604,74 @@ fetch_profile_usage() {
         # multiline string that would crash the arithmetic below under `set -e`.
         cache_ts=$(jq -r '.cached_at // 0' "$cache_file" 2>/dev/null | head -1)
         [[ "$cache_ts" =~ ^[0-9]+$ ]] || cache_ts=0
-        now_ts=$(date +%s)
-        age=$(( now_ts - cache_ts ))
-        [ "$cache_matches" = true ] && [ "$age" -lt "$USAGE_CACHE_TTL" ] && use_cache=true
+        cache_age=$(( now_ts - cache_ts ))
+        [ "$cache_age" -lt 0 ] && cache_age=0
+        if [ "$FORCE_FETCH" != true ] && [ "$cache_matches" = true ] && [ "$cache_age" -lt "$USAGE_CACHE_TTL" ]; then
+            use_cache=true
+        fi
     fi
 
     if [ "$use_cache" = true ]; then
         api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
     else
-        local token
+        local token expires_ms refreshed=false new_token
+        local refresh_stamp="${cache_file%.json}-refresh.stamp"
         token=$(jq -r '.claudeAiOauth.accessToken // ""' "$creds_file" 2>/dev/null || echo "")
-        if [ -n "$token" ]; then
-            api_resp=$(curl -s --max-time 5 \
-                -H "Authorization: Bearer $token" \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -H "User-Agent: claude-code/${CLAUDE_VERSION}" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '{}')
+        expires_ms=$(jq -r '.claudeAiOauth.expiresAt // 0' "$creds_file" 2>/dev/null | head -1)
+        [[ "$expires_ms" =~ ^[0-9]+$ ]] || expires_ms=0
+
+        # Renew before spending the request: a token that is already dead - or dies
+        # within the minute - cannot serve this fetch anyway. `refreshed` is set
+        # even when the attempt fails, so the 401 path below never doubles up.
+        if [ -n "$token" ] && [ "$expires_ms" -gt 0 ] && [ $(( expires_ms / 1000 )) -le $(( now_ts + 60 )) ]; then
+            if new_token=$(refresh_oauth_token "$creds_file" "$refresh_stamp"); then
+                token="$new_token"
+            fi
+            refreshed=true
+        fi
+
+        if [ -z "$token" ]; then
+            usage_error="no_credentials"
+        else
+            local http_code=000
+            local raw=""
+            # Two passes at most: the second only happens when the first got a 401
+            # and the refresh below produced a different token. The counter itself
+            # is never read, hence `_`.
+            for _ in 1 2; do
+                http_code=000
+                raw=""
+                api_resp="{}"
+                # `-w` appends the status on its own line, so the body is everything
+                # before it. Needed to tell "rate limited" from "offline" from a
+                # dead token - all three otherwise look like an empty response.
+                raw=$(curl -s -w '\n%{http_code}' --max-time 5 \
+                    -H "Authorization: Bearer $token" \
+                    -H "Accept: application/json" \
+                    -H "Content-Type: application/json" \
+                    -H "User-Agent: claude-code/${CLAUDE_VERSION}" \
+                    -H "anthropic-beta: oauth-2025-04-20" \
+                    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || raw=""
+                if [ -n "$raw" ]; then
+                    http_code="${raw##*$'\n'}"
+                    api_resp="${raw%$'\n'*}"
+                    [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=000
+                    [ -n "$api_resp" ] || api_resp="{}"
+                fi
+
+                # A 401 on a token the file still calls valid means the server
+                # retired it early. One refresh, one retry, never a loop.
+                if [ "$http_code" = 401 ] && [ "$refreshed" = false ]; then
+                    refreshed=true
+                    if new_token=$(refresh_oauth_token "$creds_file" "$refresh_stamp"); then
+                        if [ "$new_token" != "$token" ]; then
+                            token="$new_token"
+                            continue
+                        fi
+                    fi
+                fi
+                break
+            done
 
             if echo "$api_resp" | jq -e '.five_hour' >/dev/null 2>&1; then
                 # Write atomically: overlapping widget refreshes both target the
@@ -292,8 +684,14 @@ fetch_profile_usage() {
                 else
                     rm -f "$cache_tmp"
                 fi
-            elif [ "$cache_matches" = true ]; then
-                api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+            else
+                usage_error=$(classify_usage_error "$creds_file" "$now_ts" "$http_code" "$refresh_stamp")
+                if [ "$cache_matches" = true ]; then
+                    api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+                    usage_age="$cache_age"
+                else
+                    api_resp="{}"
+                fi
             fi
         fi
     fi
@@ -303,9 +701,20 @@ fetch_profile_usage() {
     seven_util=$(echo "$api_resp" | jq -r '.seven_day.utilization // 0')
     seven_reset=$(echo "$api_resp" | jq -r '.seven_day.resets_at // ""')
     extra=$(echo "$api_resp" | jq -r '.extra_usage.is_enabled // false')
+    # `.limits` carries the rows claude.ai lists under "Weekly limits": the
+    # all-models cap, plus a scoped one per model that has its own cap (Fable
+    # today). `seven_day` is only the all-models row, so without these the
+    # widget cannot say a model is near its own limit while the total is fine.
+    scoped=$(echo "$api_resp" | jq -r '
+        [ (.limits // [])[]
+          | select(.kind == "weekly_scoped")
+          | ((.scope.model.display_name // "") | gsub("[,:|]"; "")) as $n
+          | select($n != "")
+          | "\($n):\(.percent // 0)" ]
+        | join(",")' 2>/dev/null || echo "")
 
-    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\n' \
-        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" > "$out_file"
+    write_usage_fields "$out_file" "$sub_type" "$tier" "$five_util" "$five_reset" \
+        "$seven_util" "$seven_reset" "$extra" "$usage_age" "$usage_error" "$scoped"
 }
 
 # --- Collect profile list ---
@@ -400,8 +809,17 @@ for idx in "${!PROFILE_DIRS[@]}"; do
     fi
 
     (
-        count_profile_tokens "${PROFILE_DIRS[$idx]}" "$tmpf"
+        # Usage first: its `seven_day.resets_at` decides which seven days the
+        # week totals below have to cover. Both still run in parallel across
+        # profiles, and the fetch is cache-backed, so this costs nothing.
         fetch_profile_usage "${PROFILE_CREDS[$idx]}" "$prof_cache" "$usage_tmpf"
+        prof_week_start=$(limit_week_start \
+            "$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2-)" \
+            || echo "$WEEK_START")
+        prof_bridged=false
+        [ "$pname" = "default" ] && prof_bridged="$COUNT_BRIDGED"
+        count_profile_tokens "${PROFILE_DIRS[$idx]}" "$tmpf" "$prof_week_start" "$prof_bridged"
+        echo "WEEK_WINDOW_START=${prof_week_start}" >> "$tmpf"
     ) &
     PIDS+=("$!")
 done
@@ -411,13 +829,14 @@ for pid in "${PIDS[@]}"; do
 done
 
 # --- Read per-profile results and build aggregate + per-profile output vars ---
-WEEK_TOKENS=0; WEEK_MESSAGES=0; WEEK_SESSIONS=0; MONTH_TOKENS=0
+WEEK_TOKENS=0; WEEK_MESSAGES=0; WEEK_SESSIONS=0; MONTH_TOKENS=0; TODAY_TOKENS=0
 DAILY_ARR=(0 0 0 0 0 0 0)
 DAILY_COSTS_ARR=(0.00 0.00 0.00 0.00 0.00 0.00 0.00)
 TODAY_COST="0.00"; WEEK_COST="0.00"; MONTH_COST="0.00"
 
 PROF_WEEK_TOKENS_LIST=""
 PROF_MONTH_TOKENS_LIST=""
+PROF_TODAY_TOKENS_LIST=""
 PROF_WEEK_MESSAGES_LIST=""
 PROF_WEEK_SESSIONS_LIST=""
 PROF_TODAY_COST_LIST=""
@@ -433,6 +852,10 @@ PROF_SEVEN_DAY_UTIL=""
 PROF_FIVE_HOUR_RESET_LIST=""
 PROF_SEVEN_DAY_RESET_LIST=""
 PROF_EXTRA_USAGE_LIST=""
+PROF_USAGE_AGE_LIST=""
+PROF_USAGE_ERROR_LIST=""
+PROF_WEEKLY_SCOPED_LIST=""
+PROF_WEEK_WINDOW_LIST=""
 
 for idx in "${!TMPFILES[@]}"; do
     tmpf="${TMPFILES[$idx]}"
@@ -445,8 +868,11 @@ for idx in "${!TMPFILES[@]}"; do
     p_wm=$(grep "^WEEK_MESSAGES=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_ws=$(grep "^WEEK_SESSIONS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_mt=$(grep "^MONTH_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    p_tt=$(grep "^TODAY_TOKENS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
     p_daily=$(grep "^DAILY=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0,0,0,0,0,0,0")
     p_models=$(grep "^WEEK_MODELS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+    p_wws=$(grep "^WEEK_WINDOW_START=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "$WEEK_START")
+    [ -n "$p_wws" ] || p_wws="$WEEK_START"
     p_dc=$(grep "^DAILY_COSTS=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00,0.00,0.00,0.00,0.00,0.00,0.00")
     p_tc=$(grep "^TODAY_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
     p_wc=$(grep "^WEEK_COST=" "$tmpf" 2>/dev/null | cut -d= -f2- || echo "0.00")
@@ -454,7 +880,7 @@ for idx in "${!TMPFILES[@]}"; do
 
     # Read per-profile usage/subscription
     p_sub="unknown"; p_tier="unknown"
-    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"
+    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"; p_age=0; p_err=""; p_scoped=""
     if [ -f "$usage_tmpf" ]; then
         p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
         p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
@@ -463,6 +889,10 @@ for idx in "${!TMPFILES[@]}"; do
         p_7u=$(grep "^SEVEN_DAY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
         p_7r=$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
         p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
+        p_age=$(grep "^USAGE_AGE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        p_err=$(grep "^USAGE_ERROR=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+        p_scoped=$(grep "^WEEKLY_SCOPED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+        [[ "$p_age" =~ ^[0-9]+$ ]] || p_age=0
     fi
 
     # Default profile drives the top-level aggregate fields
@@ -474,12 +904,17 @@ for idx in "${!TMPFILES[@]}"; do
         SEVEN_DAY_UTIL="$p_7u"
         SEVEN_DAY_RESET="$p_7r"
         EXTRA_USAGE_ENABLED="$p_extra"
+        USAGE_AGE="$p_age"
+        USAGE_ERROR="$p_err"
+        WEEKLY_SCOPED="$p_scoped"
+        WEEK_WINDOW_START="$p_wws"
     fi
 
     # Aggregate token totals
     WEEK_TOKENS=$(( WEEK_TOKENS + p_wt ))
     WEEK_MESSAGES=$(( WEEK_MESSAGES + p_wm ))
     MONTH_TOKENS=$(( MONTH_TOKENS + p_mt ))
+    TODAY_TOKENS=$(( TODAY_TOKENS + p_tt ))
     WEEK_SESSIONS=$(( WEEK_SESSIONS + p_ws ))
 
     # Aggregate daily arrays (element-wise addition via awk)
@@ -504,6 +939,7 @@ for idx in "${!TMPFILES[@]}"; do
     # Per-profile token lists
     PROF_WEEK_TOKENS_LIST="${PROF_WEEK_TOKENS_LIST:+${PROF_WEEK_TOKENS_LIST},}${pname}:${p_wt}"
     PROF_MONTH_TOKENS_LIST="${PROF_MONTH_TOKENS_LIST:+${PROF_MONTH_TOKENS_LIST},}${pname}:${p_mt}"
+    PROF_TODAY_TOKENS_LIST="${PROF_TODAY_TOKENS_LIST:+${PROF_TODAY_TOKENS_LIST},}${pname}:${p_tt}"
     PROF_WEEK_MESSAGES_LIST="${PROF_WEEK_MESSAGES_LIST:+${PROF_WEEK_MESSAGES_LIST},}${pname}:${p_wm}"
     PROF_WEEK_SESSIONS_LIST="${PROF_WEEK_SESSIONS_LIST:+${PROF_WEEK_SESSIONS_LIST},}${pname}:${p_ws}"
     PROF_TODAY_COST_LIST="${PROF_TODAY_COST_LIST:+${PROF_TODAY_COST_LIST},}${pname}:${p_tc}"
@@ -521,6 +957,12 @@ for idx in "${!TMPFILES[@]}"; do
     PROF_FIVE_HOUR_RESET_LIST="${PROF_FIVE_HOUR_RESET_LIST:+${PROF_FIVE_HOUR_RESET_LIST},}${pname}:${p_5r}"
     PROF_SEVEN_DAY_RESET_LIST="${PROF_SEVEN_DAY_RESET_LIST:+${PROF_SEVEN_DAY_RESET_LIST},}${pname}:${p_7r}"
     PROF_EXTRA_USAGE_LIST="${PROF_EXTRA_USAGE_LIST:+${PROF_EXTRA_USAGE_LIST},}${pname}:${p_extra}"
+    PROF_USAGE_AGE_LIST="${PROF_USAGE_AGE_LIST:+${PROF_USAGE_AGE_LIST},}${pname}:${p_age}"
+    PROF_USAGE_ERROR_LIST="${PROF_USAGE_ERROR_LIST:+${PROF_USAGE_ERROR_LIST},}${pname}:${p_err}"
+    # Scoped limits hold `Model:percent` pairs joined by `,`, so profiles are
+    # separated by `|` here the same way PROFILE_WEEK_MODELS does it.
+    PROF_WEEKLY_SCOPED_LIST="${PROF_WEEKLY_SCOPED_LIST:+${PROF_WEEKLY_SCOPED_LIST}|}${pname}:${p_scoped}"
+    PROF_WEEK_WINDOW_LIST="${PROF_WEEK_WINDOW_LIST:+${PROF_WEEK_WINDOW_LIST},}${pname}:${p_wws}"
 
     rm -f "$tmpf" "$usage_tmpf"
 done
@@ -548,6 +990,10 @@ echo "FIVE_HOUR_RESET=${FIVE_HOUR_RESET}"
 echo "SEVEN_DAY_UTIL=${SEVEN_DAY_UTIL}"
 echo "SEVEN_DAY_RESET=${SEVEN_DAY_RESET}"
 echo "EXTRA_USAGE_ENABLED=${EXTRA_USAGE_ENABLED}"
+echo "USAGE_AGE=${USAGE_AGE}"
+echo "USAGE_ERROR=${USAGE_ERROR}"
+echo "WEEKLY_SCOPED=${WEEKLY_SCOPED}"
+echo "WEEK_WINDOW_START=${WEEK_WINDOW_START}"
 echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
 echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
 echo "WEEK_TOKENS=${WEEK_TOKENS}"
@@ -557,6 +1003,7 @@ echo "ALLTIME_MESSAGES=${ALLTIME_MESSAGES}"
 echo "FIRST_SESSION=${FIRST_SESSION}"
 echo "DAILY=${DAILY}"
 echo "MONTH_TOKENS=${MONTH_TOKENS}"
+echo "TODAY_TOKENS=${TODAY_TOKENS}"
 echo "TODAY_COST=${TODAY_COST}"
 echo "WEEK_COST=${WEEK_COST}"
 echo "MONTH_COST=${MONTH_COST}"
@@ -567,6 +1014,7 @@ echo "PROFILE_SUBSCRIPTION=${PROF_SUBSCRIPTION_LIST}"
 echo "PROFILE_TIER=${PROF_TIER_LIST}"
 echo "PROFILE_WEEK_TOKENS=${PROF_WEEK_TOKENS_LIST}"
 echo "PROFILE_MONTH_TOKENS=${PROF_MONTH_TOKENS_LIST}"
+echo "PROFILE_TODAY_TOKENS=${PROF_TODAY_TOKENS_LIST}"
 echo "PROFILE_WEEK_MESSAGES=${PROF_WEEK_MESSAGES_LIST}"
 echo "PROFILE_WEEK_SESSIONS=${PROF_WEEK_SESSIONS_LIST}"
 echo "PROFILE_TODAY_COST=${PROF_TODAY_COST_LIST}"
@@ -580,3 +1028,7 @@ echo "PROFILE_SEVEN_DAY_UTIL=${PROF_SEVEN_DAY_UTIL}"
 echo "PROFILE_FIVE_HOUR_RESET=${PROF_FIVE_HOUR_RESET_LIST}"
 echo "PROFILE_SEVEN_DAY_RESET=${PROF_SEVEN_DAY_RESET_LIST}"
 echo "PROFILE_EXTRA_USAGE=${PROF_EXTRA_USAGE_LIST}"
+echo "PROFILE_USAGE_AGE=${PROF_USAGE_AGE_LIST}"
+echo "PROFILE_USAGE_ERROR=${PROF_USAGE_ERROR_LIST}"
+echo "PROFILE_WEEKLY_SCOPED=${PROF_WEEKLY_SCOPED_LIST}"
+echo "PROFILE_WEEK_WINDOW_START=${PROF_WEEK_WINDOW_LIST}"

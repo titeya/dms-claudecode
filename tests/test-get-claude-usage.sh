@@ -27,13 +27,67 @@ setup_env() {
     echo "$dir"
 }
 
-# Mock curl: always returns empty JSON (avoids real network calls)
+# Mock curl: avoids real network calls. Mirrors `curl -w '\n%{http_code}'` — body
+# first, then the status on its own line. Tests drive it with MOCK_CURL_BODY and
+# MOCK_CURL_CODE; unset means "empty JSON, no status line", i.e. an unreachable API.
+#
+# The OAuth token endpoint gets its own fixture pair (MOCK_TOKEN_BODY /
+# MOCK_TOKEN_CODE) so a test can make the refresh succeed while the usage call
+# fails, and MOCK_CURL_BODY_2 / MOCK_CURL_CODE_2 answer the second usage call so
+# the 401-refresh-retry path can be driven. Every invocation is appended to
+# CALL_LOG, which is how tests see whether a refresh was attempted at all and
+# which token the retry carried.
+CALL_LOG="$TMPDIR_ROOT/curl-calls.log"
 mock_curl="$TMPDIR_ROOT/curl"
-cat > "$mock_curl" << 'CURLEOF'
+cat > "$mock_curl" << CURLEOF
 #!/usr/bin/env bash
-echo '{}'
+printf '%s\n' "\$*" >> "$CALL_LOG"
+
+kind=other
+for arg in "\$@"; do
+    case "\$arg" in
+        *oauth/token*) kind=token ;;
+        *oauth/usage*) [ "\$kind" = token ] || kind=usage ;;
+    esac
+done
+
+if [ "\$kind" = token ]; then
+    # Simulates Claude Code refreshing the same credentials while our request is
+    # in flight: the file gains tokens we never asked for.
+    if [ -n "\${MOCK_TOKEN_ROTATE-}" ]; then
+        cat > "\$MOCK_TOKEN_ROTATE" << ROTATEEOF
+{"claudeAiOauth":{"accessToken":"other-access","refreshToken":"other-refresh","expiresAt":\$(( (\$(date +%s) + 3600) * 1000 ))}}
+ROTATEEOF
+    fi
+    body="\${MOCK_TOKEN_BODY-}"
+    [ -n "\$body" ] || body='{}'
+    printf '%s' "\$body"
+    [ -n "\${MOCK_TOKEN_CODE-}" ] && printf '\n%s' "\$MOCK_TOKEN_CODE"
+    exit 0
+fi
+
+body="\${MOCK_CURL_BODY-}"
+code="\${MOCK_CURL_CODE-}"
+if [ "\$kind" = usage ]; then
+    count_file="$TMPDIR_ROOT/usage-calls"
+    n=\$(cat "\$count_file" 2>/dev/null || echo 0)
+    n=\$(( n + 1 ))
+    printf '%s' "\$n" > "\$count_file"
+    if [ "\$n" -ge 2 ] && [ -n "\${MOCK_CURL_BODY_2-}\${MOCK_CURL_CODE_2-}" ]; then
+        body="\${MOCK_CURL_BODY_2-}"
+        code="\${MOCK_CURL_CODE_2-}"
+    fi
+fi
+[ -n "\$body" ] || body='{}'
+printf '%s' "\$body"
+[ -n "\$code" ] && printf '\n%s' "\$code"
+exit 0
 CURLEOF
 chmod +x "$mock_curl"
+
+# Usage: calls_matching <regex> — how many mock curl invocations matched
+calls_matching() { grep -cE "$1" "$CALL_LOG" 2>/dev/null || true; }
+reset_calls() { : > "$CALL_LOG"; rm -f "$TMPDIR_ROOT/usage-calls"; }
 
 run_script() {
     local home_dir="$1"
@@ -51,12 +105,12 @@ make_jsonl_line() {
 }
 
 # ============================================================
-echo "=== Test 1: Output format — all 21 keys present ==="
+echo "=== Test 1: Output format — all 25 keys present ==="
 # ============================================================
 ENV1=$(setup_env "test1")
 OUTPUT1=$(run_script "$ENV1")
 
-EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
+EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED USAGE_AGE USAGE_ERROR WEEKLY_SCOPED WEEK_WINDOW_START WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
 for key in $EXPECTED_KEYS; do
     if echo "$OUTPUT1" | grep -q "^${key}="; then
         pass "key $key present"
@@ -714,6 +768,513 @@ if echo "$PROFILES27C" | tr ',' '\n' | grep -q '^alias$'; then
 else
     pass "duplicate config directory registered only once"
 fi
+
+# ============================================================
+echo "=== Test 28: USAGE_ERROR / USAGE_AGE report fetch trust ==="
+# ============================================================
+ENV28=$(setup_env "test28")
+
+write_creds() {
+    # Usage: write_creds <env_dir> <expiresAt_ms>
+    cat > "$1/.claude/.credentials.json" << CRED28EOF
+{
+    "claudeAiOauth": {
+        "subscriptionType": "pro",
+        "rateLimitTier": "t1_pro",
+        "accessToken": "fake-token",
+        "expiresAt": $2
+    }
+}
+CRED28EOF
+}
+
+write_usage_cache() {
+    # Usage: write_usage_cache <env_dir> <cached_at> <five_hour_util>
+    cat > "$1/.claude/usage-cache.json" << CACHE28EOF
+{
+    "cached_at": $2,
+    "identity": "$1/.claude/.credentials.json",
+    "data": {
+        "five_hour": {"utilization": $3, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 7, "resets_at": "2099-01-07T00:00:00Z"},
+        "extra_usage": {"is_enabled": false}
+    }
+}
+CACHE28EOF
+}
+
+usage_field() { echo "$1" | grep "^$2=" | cut -d= -f2-; }
+
+NOW28=$(date +%s)
+FUTURE_MS=$(( (NOW28 + 3600) * 1000 ))
+PAST_MS=$(( (NOW28 - 3600) * 1000 ))
+
+# No credentials at all
+OUT28A=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28A" USAGE_ERROR)" "no_credentials" "no credentials → no_credentials"
+assert_eq "$(usage_field "$OUT28A" USAGE_AGE)" "0" "no credentials → USAGE_AGE=0"
+
+# Live token, API refuses, nothing cached → error with no age, numbers stay 0
+write_creds "$ENV28" "$FUTURE_MS"
+export MOCK_CURL_CODE=429
+OUT28B=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28B" USAGE_ERROR)" "rate_limited" "HTTP 429 → rate_limited"
+assert_eq "$(usage_field "$OUT28B" USAGE_AGE)" "0" "429 without cache → USAGE_AGE=0"
+assert_eq "$(usage_field "$OUT28B" FIVE_HOUR_UTIL)" "0" "429 without cache → no invented utilization"
+
+# Same failure, but a stale cache exists → cached numbers served WITH their age
+write_usage_cache "$ENV28" "$(( NOW28 - 3600 ))" 42
+OUT28C=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28C" USAGE_ERROR)" "rate_limited" "stale cache keeps the failure reason"
+assert_eq "$(usage_field "$OUT28C" FIVE_HOUR_UTIL)" "42" "stale cache still provides utilization"
+AGE28C=$(usage_field "$OUT28C" USAGE_AGE)
+if [ "$AGE28C" -ge 3600 ] && [ "$AGE28C" -lt 3660 ]; then
+    pass "stale cache reports its age (~3600s, got ${AGE28C}s)"
+else
+    fail "stale cache age expected ~3600s, got '${AGE28C}s'"
+fi
+
+# 401/403 and an unreachable API get their own reasons
+export MOCK_CURL_CODE=401
+assert_eq "$(usage_field "$(run_script "$ENV28")" USAGE_ERROR)" "unauthorized" "HTTP 401 → unauthorized"
+unset MOCK_CURL_CODE
+assert_eq "$(usage_field "$(run_script "$ENV28")" USAGE_ERROR)" "offline" "no HTTP status → offline"
+
+# An expired login outranks the HTTP code: it is the cause the user can act on
+write_creds "$ENV28" "$PAST_MS"
+export MOCK_CURL_CODE=429
+assert_eq "$(usage_field "$(run_script "$ENV28")" USAGE_ERROR)" "token_expired" \
+    "expired token wins over the HTTP code"
+unset MOCK_CURL_CODE
+
+# A successful fetch must clear the warning even though a stale cache is on disk
+write_creds "$ENV28" "$FUTURE_MS"
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY='{"five_hour":{"utilization":3,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":1,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+OUT28D=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28D" USAGE_ERROR)" "" "successful fetch → empty USAGE_ERROR"
+assert_eq "$(usage_field "$OUT28D" USAGE_AGE)" "0" "successful fetch → USAGE_AGE=0"
+assert_eq "$(usage_field "$OUT28D" FIVE_HOUR_UTIL)" "3" "successful fetch → live utilization"
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+# A cache inside the TTL is a normal hit, not a stale read
+write_usage_cache "$ENV28" "$NOW28" 42
+OUT28E=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUT28E" USAGE_ERROR)" "" "fresh cache → no warning"
+assert_eq "$(usage_field "$OUT28E" USAGE_AGE)" "0" "fresh cache → USAGE_AGE=0"
+
+# Per-profile lists carry the same two fields
+assert_match "$(usage_field "$OUT28C" PROFILE_USAGE_ERROR)" "default:rate_limited" \
+    "PROFILE_USAGE_ERROR names the profile"
+assert_match "$(usage_field "$OUT28C" PROFILE_USAGE_AGE)" "default:[0-9]+" \
+    "PROFILE_USAGE_AGE names the profile"
+
+# ============================================================
+echo ""
+echo "=== Test 29: --force bypasses the usage cache ==="
+# ============================================================
+# The popout refresh button passes `--force`. With a fresh cache on disk saying
+# 42 and the API saying 7, a plain run serves the cache and a forced run refetches
+# - otherwise the manual refresh would replay the numbers the user clicked to
+# get rid of. The flag must also never be mistaken for a `name=path` profile.
+ENV29=$(setup_env "test29")
+write_creds "$ENV29" "$FUTURE_MS"
+write_usage_cache "$ENV29" "$(date +%s)" 42
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY='{"five_hour":{"utilization":7,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":2,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+
+assert_eq "$(usage_field "$(run_script "$ENV29")" FIVE_HOUR_UTIL)" "42" \
+    "fresh cache serves the cached number"
+OUT29=$(run_script "$ENV29" --force)
+assert_eq "$(usage_field "$OUT29" FIVE_HOUR_UTIL)" "7" "--force refetches past a fresh cache"
+assert_eq "$(usage_field "$OUT29" PROFILES)" "default" "--force is not registered as a profile"
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+# ============================================================
+echo ""
+echo "=== Test 30: expired access token is refreshed in place ==="
+# ============================================================
+# The widget outlives the ~12h access token. Before this, a dead token meant every
+# fetch was refused until Claude Code itself ran; now the script does the
+# `refresh_token` grant. These assertions guard the credentials file, which is the
+# expensive thing to get wrong: a bad write breaks the user's login.
+ENV30=$(setup_env "test30")
+CREDS30="$ENV30/.claude/.credentials.json"
+STAMP30="$ENV30/.claude/usage-cache-refresh.stamp"
+USAGE_OK30='{"five_hour":{"utilization":9,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":3,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+
+write_refreshable_creds() {
+    # Usage: write_refreshable_creds <expiresAt_ms> <refreshToken> [refreshTokenExpiresAt_ms]
+    # `mcpOAuth` is a key this script knows nothing about - it must survive.
+    local rexp="${3-}"
+    cat > "$CREDS30" << CRED30EOF
+{
+    "claudeAiOauth": {
+        "subscriptionType": "team",
+        "rateLimitTier": "default_claude_max_5x",
+        "accessToken": "old-access",
+        "refreshToken": "$2",
+        "expiresAt": $1,
+        ${rexp:+\"refreshTokenExpiresAt\": $rexp,}
+        "scopes": ["user:profile", "user:inference"]
+    },
+    "mcpOAuth": {"some-server": {"accessToken": "keep-me"}}
+}
+CRED30EOF
+    chmod 600 "$CREDS30"
+}
+
+creds_field() { jq -r "$1" "$CREDS30" 2>/dev/null; }
+# Each sub-case below wants a real fetch, and the previous one leaves a fresh
+# usage cache behind - which would serve numbers and skip the refresh entirely.
+reset30() { reset_calls; rm -f "$ENV30/.claude/usage-cache.json"; }
+
+# --- Expired token, refresh works: numbers go live and the file is updated ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","refresh_token":"new-refresh","expires_in":43200,"refresh_token_expires_in":2592000,"scope":"user:profile user:inference user:mcp_servers"}'
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="$USAGE_OK30"
+OUT30A=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30A" USAGE_ERROR)" "" "refreshed token → no warning"
+assert_eq "$(usage_field "$OUT30A" USAGE_AGE)" "0" "refreshed token → live numbers"
+assert_eq "$(usage_field "$OUT30A" FIVE_HOUR_UTIL)" "9" "refreshed token → real utilization"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "new-access" "new access token stored"
+assert_eq "$(creds_field '.claudeAiOauth.refreshToken')" "new-refresh" "rotated refresh token stored"
+assert_eq "$(creds_field '.mcpOAuth."some-server".accessToken')" "keep-me" "unrelated credentials keys survive"
+assert_eq "$(creds_field '.claudeAiOauth.subscriptionType')" "team" "subscription details survive"
+assert_eq "$(creds_field '.claudeAiOauth.scopes | join(",")')" "user:profile,user:inference,user:mcp_servers" \
+    "granted scopes replace the requested ones"
+assert_eq "$(stat -c '%a' "$CREDS30")" "600" "credentials file keeps mode 600"
+EXP30=$(creds_field '.claudeAiOauth.expiresAt')
+if [ "$EXP30" -gt "$(( NOW28 * 1000 ))" ]; then
+    pass "expiresAt moved into the future"
+else
+    fail "expiresAt not renewed (got $EXP30)"
+fi
+assert_eq "$(calls_matching 'Bearer new-access')" "1" "usage fetch used the refreshed token"
+assert_eq "$(calls_matching 'User-Agent: dms-claudecode.*oauth/token')" "1" "the refresh says who it really is"
+assert_eq "$(calls_matching 'User-Agent: claude-code.*oauth/token')" "0" "the refresh does not impersonate Claude Code"
+if [ -f "$STAMP30" ]; then fail "successful refresh left a backoff stamp"; else pass "successful refresh leaves no backoff stamp"; fi
+
+# --- Refresh refused: credentials untouched, user told to run claude ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=400
+export MOCK_TOKEN_BODY='{"error":"invalid_grant"}'
+export MOCK_CURL_CODE=401
+export MOCK_CURL_BODY='{}'
+OUT30B=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30B" USAGE_ERROR)" "token_expired" "failed refresh → token_expired"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "old-access" "failed refresh does not touch the login"
+assert_eq "$(creds_field '.claudeAiOauth.refreshToken')" "old-refresh" "failed refresh keeps the refresh token"
+if [ -f "$STAMP30" ]; then pass "failed refresh records a backoff stamp"; else fail "no backoff stamp after failure"; fi
+
+# --- Backoff: the next run does not retry a refresh that just failed ---
+reset30
+OUT30C=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "backoff suppresses the immediate retry"
+assert_eq "$(usage_field "$OUT30C" USAGE_ERROR)" "token_expired" "backoff still reports the cause"
+rm -f "$STAMP30"
+
+# --- Throttled refresh: the login is fine, so do not tell the user to log in ---
+# The token endpoint refuses some agent strings with a 429 before it even looks at
+# the grant. That is a wait, not a dead login, and the stamp carries the code so
+# the suppressed retry keeps saying the same thing.
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=429
+export MOCK_TOKEN_BODY='{"error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}'
+OUT30I=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30I" USAGE_ERROR)" "rate_limited" "throttled refresh → rate_limited, not token_expired"
+assert_eq "$(awk 'NR==1 {print $2}' "$STAMP30")" "429" "the stamp records the refresh status code"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "old-access" "throttled refresh does not touch the login"
+reset30
+OUT30J=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "throttled refresh backs off like any other failure"
+assert_eq "$(usage_field "$OUT30J" USAGE_ERROR)" "rate_limited" "backoff keeps reporting the throttle"
+rm -f "$STAMP30"
+
+# --- 200 with a body that is not a token: treated as a failure ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"unexpected":"shape"}'
+OUT30D=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30D" USAGE_ERROR)" "token_expired" "malformed token response → token_expired"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "old-access" "malformed token response does not touch the login"
+rm -f "$STAMP30"
+
+# --- A dead refresh token cannot be refreshed: do not even ask ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$PAST_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","expires_in":43200}'
+OUT30E=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "expired refresh token → no request spent"
+assert_eq "$(usage_field "$OUT30E" USAGE_ERROR)" "token_expired" "expired refresh token → token_expired"
+
+# --- No refresh token at all (old credentials file): no request, same message ---
+write_refreshable_creds "$PAST_MS" "" "$FUTURE_MS"
+reset30
+OUT30F=$(run_script "$ENV30")
+assert_eq "$(calls_matching 'oauth/token')" "0" "missing refresh token → no request spent"
+assert_eq "$(usage_field "$OUT30F" USAGE_ERROR)" "token_expired" "missing refresh token → token_expired"
+rm -f "$STAMP30"
+
+# --- 401 on a token the file still calls valid: refresh, then retry once ---
+write_refreshable_creds "$FUTURE_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","refresh_token":"new-refresh","expires_in":43200}'
+export MOCK_CURL_CODE=401
+export MOCK_CURL_BODY='{}'
+export MOCK_CURL_CODE_2=200
+export MOCK_CURL_BODY_2="$USAGE_OK30"
+OUT30G=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUT30G" USAGE_ERROR)" "" "401 on a live token → refresh and retry recovers"
+assert_eq "$(usage_field "$OUT30G" FIVE_HOUR_UTIL)" "9" "retry after refresh returns real numbers"
+assert_eq "$(calls_matching 'oauth/token')" "1" "the retry refreshes exactly once"
+assert_eq "$(calls_matching 'Bearer new-access')" "1" "the retry carries the new token"
+unset MOCK_CURL_CODE_2 MOCK_CURL_BODY_2
+
+# --- Someone else refreshed mid-flight: use their token, leave the file alone ---
+write_refreshable_creds "$PAST_MS" "old-refresh" "$FUTURE_MS"
+reset30
+export MOCK_TOKEN_ROTATE="$CREDS30"
+export MOCK_TOKEN_CODE=200
+export MOCK_TOKEN_BODY='{"access_token":"new-access","refresh_token":"new-refresh","expires_in":43200}'
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="$USAGE_OK30"
+OUT30H=$(run_script "$ENV30")
+unset MOCK_TOKEN_ROTATE
+assert_eq "$(creds_field '.claudeAiOauth.refreshToken')" "other-refresh" \
+    "a concurrent refresh is not overwritten"
+assert_eq "$(creds_field '.claudeAiOauth.accessToken')" "other-access" \
+    "the concurrent writer's access token is kept"
+assert_eq "$(calls_matching 'Bearer other-access')" "1" "the fetch uses the concurrent writer's token"
+assert_eq "$(usage_field "$OUT30H" USAGE_ERROR)" "" "concurrent refresh still yields live numbers"
+unset MOCK_TOKEN_CODE MOCK_TOKEN_BODY MOCK_CURL_CODE MOCK_CURL_BODY
+
+# ============================================================
+echo ""
+echo "=== Test 31: decorated model ids fold into their family ==="
+# ============================================================
+# Claude Code reports whatever id the backend uses: Bedrock adds a region and a
+# version (`us.anthropic.…-v1:0`), Vertex a publisher path or an `@date`, a proxy
+# its own prefix. Without normalisation each spelling becomes its own row in the
+# model card and misses the pricing table, so one model reads as four unpriced
+# ones.
+ENV31=$(setup_env "test31")
+cat > "$ENV31/.claude/pricing-cache.json" << 'PRICE31EOF'
+{
+    "updated": "2099-12-31",
+    "models": {
+        "sonnet": {"input": 0.000003, "output": 0.000015, "cache_read": 0.0000003, "cache_write": 0.00000375},
+        "opus": {"input": 0.000015, "output": 0.000075, "cache_read": 0.0000015, "cache_write": 0.00001875}
+    }
+}
+PRICE31EOF
+
+{
+    make_jsonl_line "$TODAY" "us.anthropic.claude-sonnet-4-5-20250929-v1:0" 1000000 0 0 0 "sess-bedrock"
+    make_jsonl_line "$TODAY" "claude-sonnet-4-5@20250929" 1000000 0 0 0 "sess-vertex"
+    make_jsonl_line "$TODAY" "cliproxy/claude-opus-5" 1000000 0 0 0 "sess-proxy"
+    make_jsonl_line "$TODAY" "claude-sonnet-4-20250514" 1000000 0 0 0 "sess-plain"
+    make_jsonl_line "$TODAY" "openrouter/qwen3-coder" 1000000 0 0 0 "sess-other"
+} > "$ENV31/.claude/projects/test-project/test.jsonl"
+
+OUT31=$(run_script "$ENV31")
+MODELS31=$(usage_field "$OUT31" WEEK_MODELS)
+assert_match "$MODELS31" "(^|,)sonnet=3000000(,|$)" "bedrock, vertex and plain ids all count as sonnet"
+assert_match "$MODELS31" "(^|,)opus=1000000(,|$)" "a proxy-prefixed id counts as opus"
+assert_match "$MODELS31" "(^|,)qwen3-coder=1000000(,|$)" "a non-Claude id keeps its name without the proxy prefix"
+if echo "$MODELS31" | grep -qE 'cliproxy|openrouter|anthropic|v1|@'; then
+    fail "decorated ids leaked into the model card ($MODELS31)"
+else
+    pass "no decorated id survives in the model card"
+fi
+assert_eq "$(usage_field "$OUT31" TODAY_COST)" "24.00" "every decorated id matched the pricing table"
+
+# ============================================================
+echo ""
+echo "=== Test 32: week totals cover the rate limit window, not Monday-to-now ==="
+# ============================================================
+# `seven_day.resets_at` lands on a fixed weekday, so the seven days the ring
+# measures rarely start on a Monday. Counting tokens from Monday puts a total
+# from one window next to a percentage from another - on a Monday morning that
+# reads as if the whole weekly percentage came from today's few messages.
+ENV32=$(setup_env "test32")
+write_creds "$ENV32" "$FUTURE_MS"
+
+# Reset two days out ⇒ the window opened five days ago.
+RESET32=$(date -u -d "+2 days" +%Y-%m-%dT03:00:00+00:00)
+WINDOW32=$(date -d "-5 days" +%Y-%m-%d)
+BEFORE32=$(date -d "-6 days" +%Y-%m-%d)
+
+{
+    make_jsonl_line "$BEFORE32" "claude-opus-4" 1000 0 0 0 "sess-before"
+    make_jsonl_line "$WINDOW32" "claude-opus-4" 2000 0 0 0 "sess-edge"
+    make_jsonl_line "$TODAY" "claude-opus-4" 4000 0 0 0 "sess-today"
+} > "$ENV32/.claude/projects/test-project/test.jsonl"
+
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":71,\"resets_at\":\"$RESET32\"},\"extra_usage\":{\"is_enabled\":false},\"limits\":[{\"kind\":\"session\",\"percent\":10},{\"kind\":\"weekly_all\",\"percent\":71},{\"kind\":\"weekly_scoped\",\"percent\":6,\"scope\":{\"model\":{\"display_name\":\"Fable, 1M:x\"}}}]}"
+OUT32=$(run_script "$ENV32")
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+assert_eq "$(usage_field "$OUT32" WEEK_WINDOW_START)" "$WINDOW32" \
+    "the window starts seven days before the reset"
+assert_eq "$(usage_field "$OUT32" WEEK_TOKENS)" "6000" \
+    "only the days inside the window are counted"
+assert_eq "$(usage_field "$OUT32" WEEK_SESSIONS)" "2" \
+    "sessions follow the same window"
+assert_eq "$(usage_field "$OUT32" WEEK_MESSAGES)" "2" \
+    "messages follow the same window"
+# The strip covers the same seven days as the totals above it, so a bar's
+# position is an offset from the window start, not a weekday.
+DAILY32=$(usage_field "$OUT32" DAILY)
+assert_eq "$(echo "$DAILY32" | cut -d, -f1)" "2000" \
+    "the strip starts on the window's first day"
+assert_eq "$(echo "$DAILY32" | cut -d, -f6)" "4000" \
+    "today sits five days into a window that opened five days ago"
+assert_eq "$(echo "$DAILY32" | awk -F, '{ s = 0; for (i = 1; i <= NF; i++) s += $i; print s }')" "6000" \
+    "the bars add up to the week total"
+assert_eq "$(usage_field "$OUT32" TODAY_TOKENS)" "4000" \
+    "today is reported on its own, not read out of the strip"
+assert_eq "$(echo "$DAILY32" | cut -d, -f7)" "0" \
+    "the day after tomorrow is empty, not the day before the window"
+assert_eq "$(usage_field "$OUT32" WEEKLY_SCOPED)" "Fable 1Mx:6" \
+    "a scoped weekly limit is reported per model, delimiters stripped"
+
+# Without a reset to align to there is no window, so the calendar week stands in.
+ENV32B=$(setup_env "test32b")
+CAL_WEEK32=$(date -d "$(( $(date +%u) - 1 )) days ago" +%Y-%m-%d)
+OUT32B=$(run_script "$ENV32B")
+assert_eq "$(usage_field "$OUT32B" WEEK_WINDOW_START)" "$CAL_WEEK32" \
+    "no usable reset falls back to the calendar week"
+assert_eq "$(usage_field "$OUT32B" WEEKLY_SCOPED)" "" \
+    "no response means no scoped limits are invented"
+
+# A plan with no per-model cap must not grow an empty row.
+ENV32C=$(setup_env "test32c")
+write_creds "$ENV32C" "$FUTURE_MS"
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":40,\"resets_at\":\"$RESET32\"},\"limits\":[{\"kind\":\"weekly_all\",\"percent\":40},{\"kind\":\"weekly_scoped\",\"percent\":3,\"scope\":null}]}"
+OUT32C=$(run_script "$ENV32C")
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+assert_eq "$(usage_field "$OUT32C" WEEKLY_SCOPED)" "" \
+    "a scoped row without a model name is dropped"
+
+# ============================================================
+echo ""
+echo "=== Test 33: on a reset day today rides along outside the strip ==="
+# ============================================================
+# When the reset lands later today the window's seven days end yesterday, but
+# the hours since midnight still count toward the window that is closing. The
+# strip has no column for today, so TODAY_TOKENS has to be counted by date -
+# reading the last bar would report yesterday's usage as today's.
+ENV33=$(setup_env "test33")
+write_creds "$ENV33" "$FUTURE_MS"
+
+# Local noon today, expressed in UTC: the date of the boundary is today whatever
+# the current hour is, so the window always starts seven days back.
+RESET33=$(date -u -d "today 12:00" +%Y-%m-%dT%H:%M:%S+00:00)
+WINDOW33=$(date -d "-7 days" +%Y-%m-%d)
+YESTERDAY33=$(date -d "-1 day" +%Y-%m-%d)
+
+{
+    make_jsonl_line "$WINDOW33" "claude-opus-4" 1000 0 0 0 "sess-first"
+    make_jsonl_line "$YESTERDAY33" "claude-opus-4" 2000 0 0 0 "sess-last"
+    make_jsonl_line "$TODAY" "claude-opus-4" 500 0 0 0 "sess-today"
+} > "$ENV33/.claude/projects/test-project/test.jsonl"
+
+export MOCK_CURL_CODE=200
+export MOCK_CURL_BODY="{\"five_hour\":{\"utilization\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"},\"seven_day\":{\"utilization\":80,\"resets_at\":\"$RESET33\"},\"extra_usage\":{\"is_enabled\":false}}"
+OUT33=$(run_script "$ENV33")
+unset MOCK_CURL_CODE MOCK_CURL_BODY
+
+assert_eq "$(usage_field "$OUT33" WEEK_WINDOW_START)" "$WINDOW33" \
+    "a reset later today opens the window seven days back"
+DAILY33=$(usage_field "$OUT33" DAILY)
+assert_eq "$(echo "$DAILY33" | cut -d, -f1)" "1000" \
+    "the window's first day is the first bar"
+assert_eq "$(echo "$DAILY33" | cut -d, -f7)" "2000" \
+    "yesterday is the last bar, today has none"
+assert_eq "$(usage_field "$OUT33" TODAY_TOKENS)" "500" \
+    "today is still counted, from its date"
+assert_eq "$(usage_field "$OUT33" WEEK_TOKENS)" "3500" \
+    "the closing window keeps today's hours in its total"
+assert_eq "$(usage_field "$OUT33" PROFILE_TODAY_TOKENS)" "default:500" \
+    "today is reported per profile too"
+# ============================================================
+echo ""
+echo "=== Test 34: bridged clients on the same subscription are counted ==="
+# ============================================================
+# Anything pointed at a bridge (cliproxyapi and friends) spends this very
+# subscription while writing its transcripts somewhere else entirely. Those
+# tokens are already inside the rate limit rings, so leaving them out is what
+# reads as broken: "today 0 tokens" under a ring that says 16% used.
+ENV34=$(setup_env "test34")
+
+# pi's layout: ~/.pi/agent/sessions/<cwd>/<stamp>_<uuid>.jsonl, plus one such
+# tree per named profile. Session ids live in the filename, not the records.
+mkdir -p "$ENV34/.pi/agent/sessions/--home-user--" "$ENV34/.pi/profiles/work/sessions/--home-user-src--"
+
+# Usage: make_bridged_line <date> <model> <input> <output> <cacheRead> <cacheWrite> [cost]
+make_bridged_line() {
+    local date="$1" model="$2" inp="$3" out="$4" cr="$5" cw="$6" cost="${7:-}"
+    local cost_json=""
+    [ -n "$cost" ] && cost_json=",\"cost\":{\"total\":$cost}"
+    printf '{"type":"message","timestamp":"%sT12:00:00Z","message":{"role":"assistant","model":"%s","usage":{"input":%d,"output":%d,"cacheRead":%d,"cacheWrite":%d%s}}}\n' \
+        "$date" "$model" "$inp" "$out" "$cr" "$cw" "$cost_json"
+}
+
+make_jsonl_line "$TODAY" "claude-opus-4" 100 0 0 0 "cc-session" \
+    > "$ENV34/.claude/projects/test-project/test.jsonl"
+{
+    make_bridged_line "$TODAY" "claude-opus-4" 10 20 30 40 "1.50"
+    # Same account, other harness, a model no pricing table knows: without the
+    # transcript's own cost this call would be free.
+    make_bridged_line "$TODAY" "claude-fable-5" 1 2 3 4 "0.25"
+    # Not Claude, not this subscription.
+    make_bridged_line "$TODAY" "gemini-3-pro" 5000 5000 0 0 "9.99"
+    # User turns and tool results are not billable assistant answers.
+    printf '{"type":"message","timestamp":"%sT12:00:00Z","message":{"role":"user","content":"hi"}}\n' "$TODAY"
+} > "$ENV34/.pi/agent/sessions/--home-user--/2026-08-17T08-00-00-000Z_aaaa-1111.jsonl"
+make_bridged_line "$TODAY" "claude-sonnet-4-5" 1000 0 0 0 "2.00" \
+    > "$ENV34/.pi/profiles/work/sessions/--home-user-src--/2026-08-17T09-00-00-000Z_bbbb-2222.jsonl"
+
+OUT34=$(run_script "$ENV34")
+
+assert_eq "$(usage_field "$OUT34" TODAY_TOKENS)" "1210" \
+    "bridged Claude tokens land in today's total, other vendors do not"
+assert_eq "$(usage_field "$OUT34" WEEK_SESSIONS)" "3" \
+    "each bridged transcript file counts as its own session"
+assert_eq "$(usage_field "$OUT34" WEEK_MESSAGES)" "4" \
+    "only assistant answers are counted as messages"
+assert_match "$(usage_field "$OUT34" WEEK_MODELS)" "fable=10" \
+    "a bridged model unknown to the pricing table still gets its own row"
+assert_eq "$(usage_field "$OUT34" TODAY_COST)" "3.75" \
+    "the cost the transcript computed itself is used, tables cannot price fable"
+assert_eq "$(usage_field "$OUT34" PROFILE_TODAY_TOKENS)" "default:1210" \
+    "bridged usage belongs to the login whose rings the popout shows"
+
+# The opt-out has to reproduce the old, Claude-Code-only numbers exactly.
+OUT34B=$(run_script "$ENV34" --no-bridged)
+assert_eq "$(usage_field "$OUT34B" TODAY_TOKENS)" "100" \
+    "--no-bridged counts Claude Code transcripts only"
+assert_eq "$(usage_field "$OUT34B" WEEK_SESSIONS)" "1" \
+    "--no-bridged leaves bridged sessions out of the session count"
+
+# A machine that never ran another client must behave exactly as before.
+ENV34C=$(setup_env "test34c")
+make_jsonl_line "$TODAY" "claude-opus-4" 100 0 0 0 "cc-session" \
+    > "$ENV34C/.claude/projects/test-project/test.jsonl"
+OUT34C=$(run_script "$ENV34C")
+assert_eq "$(usage_field "$OUT34C" TODAY_TOKENS)" "100" \
+    "no bridged transcripts anywhere changes nothing"
 
 # ============================================================
 echo ""
