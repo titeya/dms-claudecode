@@ -49,6 +49,20 @@ PluginSettings {
         defaultValue: true
     }
 
+    ToggleSetting {
+        settingKey: "enableClaude"
+        label: root.tr("Enable Claude Source")
+        description: root.tr("Show Claude Code usage. Off, or Claude Code not installed, hides its ring entirely.")
+        defaultValue: true
+    }
+
+    ToggleSetting {
+        settingKey: "enableChatgpt"
+        label: root.tr("Enable ChatGPT Source")
+        description: root.tr("Show Codex/ChatGPT usage. Off, or Codex not installed, hides its ring entirely.")
+        defaultValue: true
+    }
+
     Rectangle {
         width: parent.width
         height: 1
@@ -241,6 +255,202 @@ PluginSettings {
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 visible: customProfilesSetting.items.length === 0
+            }
+        }
+    }
+
+    Rectangle {
+        width: parent.width
+        height: 1
+        color: Theme.outline
+        opacity: 0.3
+    }
+
+    Column {
+        id: customChatgptAccountsSetting
+
+        width: parent.width
+        spacing: Theme.spacingM
+
+        property var items: []
+        property bool isLoading: false
+        readonly property real nameColumnWidth: Math.min(130, Math.max(100, width * 0.27))
+        readonly property real actionWidth: 92
+
+        Component.onCompleted: loadValue()
+
+        function loadValue() {
+            isLoading = true;
+            items = root.loadValue("customChatgptAccounts", []);
+            isLoading = false;
+        }
+
+        function saveItems(newItems) {
+            items = newItems;
+            if (!isLoading)
+                root.saveValue("customChatgptAccounts", items);
+        }
+
+        function addItem() {
+            var name = chatgptAccountNameInput.text.trim();
+            var path = chatgptAccountPathInput.text.trim();
+            if (!name || !path)
+                return;
+
+            saveItems(items.concat([{
+                name: name,
+                path: path
+            }]));
+            chatgptAccountNameInput.text = "";
+            chatgptAccountPathInput.text = "";
+            chatgptAccountNameInput.forceActiveFocus();
+        }
+
+        function removeItem(index) {
+            var updatedItems = items.slice();
+            updatedItems.splice(index, 1);
+            saveItems(updatedItems);
+        }
+
+        StyledText {
+            text: root.tr("Custom ChatGPT Accounts")
+            font.pixelSize: Theme.fontSizeMedium
+            font.weight: Font.Medium
+            color: Theme.surfaceText
+        }
+
+        StyledText {
+            width: parent.width
+            text: root.tr("Track extra Codex accounts. Point at a CODEX_HOME (the folder containing auth.json). ~/.codex is detected automatically as \"default\".")
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
+
+        Row {
+            width: parent.width
+            spacing: Theme.spacingS
+
+            StyledText {
+                width: customChatgptAccountsSetting.nameColumnWidth
+                text: root.tr("Name")
+                font.pixelSize: Theme.fontSizeSmall
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+            }
+
+            StyledText {
+                width: parent.width - customChatgptAccountsSetting.nameColumnWidth - customChatgptAccountsSetting.actionWidth - parent.spacing * 2
+                text: root.tr("Config directory")
+                font.pixelSize: Theme.fontSizeSmall
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+            }
+
+            Item {
+                width: customChatgptAccountsSetting.actionWidth
+                height: 1
+            }
+        }
+
+        Row {
+            width: parent.width
+            spacing: Theme.spacingS
+
+            DankTextField {
+                id: chatgptAccountNameInput
+                width: customChatgptAccountsSetting.nameColumnWidth
+                placeholderText: "work"
+                Keys.onReturnPressed: customChatgptAccountsSetting.addItem()
+            }
+
+            DankTextField {
+                id: chatgptAccountPathInput
+                width: parent.width - customChatgptAccountsSetting.nameColumnWidth - customChatgptAccountsSetting.actionWidth - parent.spacing * 2
+                placeholderText: "~/.codex-work"
+                Keys.onReturnPressed: customChatgptAccountsSetting.addItem()
+            }
+
+            DankButton {
+                width: customChatgptAccountsSetting.actionWidth
+                height: 40
+                text: root.tr("Add")
+                onClicked: customChatgptAccountsSetting.addItem()
+            }
+        }
+
+        Column {
+            width: parent.width
+            spacing: Theme.spacingS
+
+            Repeater {
+                model: customChatgptAccountsSetting.items
+
+                StyledRect {
+                    required property int index
+                    required property var modelData
+
+                    width: parent.width
+                    height: 44
+                    radius: Theme.cornerRadius
+                    color: Theme.withAlpha(Theme.surfaceContainerHigh, Theme.popupTransparency)
+                    border.width: 0
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingS
+                        spacing: Theme.spacingS
+
+                        StyledText {
+                            width: customChatgptAccountsSetting.nameColumnWidth
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.name || ""
+                            color: Theme.surfaceText
+                            font.pixelSize: Theme.fontSizeMedium
+                            elide: Text.ElideRight
+                        }
+
+                        StyledText {
+                            width: parent.width - customChatgptAccountsSetting.nameColumnWidth - customChatgptAccountsSetting.actionWidth - parent.spacing * 2
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.path || ""
+                            color: Theme.surfaceVariantText
+                            font.pixelSize: Theme.fontSizeMedium
+                            elide: Text.ElideMiddle
+                        }
+
+                        Rectangle {
+                            width: customChatgptAccountsSetting.actionWidth
+                            height: 32
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: chatgptRemoveArea.containsMouse ? Theme.errorHover : Theme.error
+                            radius: Theme.cornerRadius
+
+                            StyledText {
+                                anchors.centerIn: parent
+                                text: root.tr("Remove")
+                                color: Theme.onError
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.weight: Font.Medium
+                            }
+
+                            MouseArea {
+                                id: chatgptRemoveArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: customChatgptAccountsSetting.removeItem(index)
+                            }
+                        }
+                    }
+                }
+            }
+
+            StyledText {
+                text: root.tr("No items added yet")
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                visible: customChatgptAccountsSetting.items.length === 0
             }
         }
     }

@@ -14,6 +14,9 @@ FAIL=0
 
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
+assert_eq() {
+    if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
+}
 
 # Run a JS expression and capture stdout
 run_js() {
@@ -138,6 +141,29 @@ function parseLine(line, state) {
         break
     }
     return state
+}
+
+var countdownNow = 0
+
+function paceInfo(util, resetIso, windowMs) {
+    util = util || 0
+    if (!resetIso || !windowMs)
+        return util >= 100 ? { timeFrac: 1, delta: util, status: "over_quota" }
+            : { timeFrac: 0, delta: 0, status: "unknown" }
+    var resetMs = new Date(resetIso).getTime()
+    if (isNaN(resetMs))
+        return { timeFrac: 0, delta: 0, status: "unknown" }
+    var remaining = resetMs - countdownNow
+    var timeFrac = (windowMs - remaining) / windowMs
+    if (timeFrac < 0) timeFrac = 0
+    else if (timeFrac > 1) timeFrac = 1
+    var delta = util - timeFrac * 100
+    var status
+    if (util >= 100) status = "over_quota"
+    else if (delta >= 5) status = "over"
+    else if (delta <= -5) status = "under"
+    else status = "on"
+    return { timeFrac: timeFrac, delta: delta, status: status }
 }
 '
 
@@ -424,6 +450,54 @@ if [ "$RESULT_MODELS_BAD" = '[{"modelName":"opus","modelTokens":5000},{"modelNam
 else
     fail "parseLine WEEK_MODELS malformed expected opus+sonnet only, got $RESULT_MODELS_BAD"
 fi
+
+# paceInfo — shared by Claude (hardcoded window) and ChatGPT (real,
+# API-reported window) callers alike.
+RESULT_PACE_ON=$(run_js "${JS_HARNESS}
+    // countdownNow=0, window=18000000 (5h), reset in 9000000ms => timeFrac=0.5, util=50 => on pace
+    console.log(paceInfo(50, new Date(9000000).toISOString(), 18000000).status)
+")
+assert_eq "$RESULT_PACE_ON" "on" "paceInfo: on pace when util tracks elapsed time"
+
+RESULT_PACE_OVER=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(80, new Date(9000000).toISOString(), 18000000).status)
+")
+assert_eq "$RESULT_PACE_OVER" "over" "paceInfo: over pace when util well ahead of elapsed time"
+
+RESULT_PACE_UNDER=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(10, new Date(9000000).toISOString(), 18000000).status)
+")
+assert_eq "$RESULT_PACE_UNDER" "under" "paceInfo: under pace when util well behind elapsed time"
+
+RESULT_PACE_QUOTA=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(100, new Date(9000000).toISOString(), 18000000).status)
+")
+assert_eq "$RESULT_PACE_QUOTA" "over_quota" "paceInfo: over_quota once util reaches 100 regardless of elapsed time"
+
+RESULT_PACE_NORESET=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(50, '', 18000000).status)
+")
+assert_eq "$RESULT_PACE_NORESET" "unknown" "paceInfo: unknown with no reset timestamp and util<100"
+
+RESULT_PACE_NORESET_FULL=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(100, '', 18000000).status)
+")
+assert_eq "$RESULT_PACE_NORESET_FULL" "over_quota" "paceInfo: over_quota with no reset timestamp but util=100"
+
+# Regression: a zero/missing window length (e.g. before a Source's first
+# fetch, or an API response missing limit_window_seconds) must not be
+# treated as an elapsed-100%-of-window state — that previously produced a
+# false "over pace" for any nonzero util (division by zero -> -Infinity ->
+# clamped timeFrac 0, so delta == util for any positive util).
+RESULT_PACE_ZEROWINDOW=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(50, new Date(9000000).toISOString(), 0).status)
+")
+assert_eq "$RESULT_PACE_ZEROWINDOW" "unknown" "paceInfo: zero window length falls back to unknown, not a false over-pace"
+
+RESULT_PACE_ZEROWINDOW_FULL=$(run_js "${JS_HARNESS}
+    console.log(paceInfo(100, new Date(9000000).toISOString(), 0).status)
+")
+assert_eq "$RESULT_PACE_ZEROWINDOW_FULL" "over_quota" "paceInfo: zero window length still reports over_quota at util=100"
 
 # ============================================================
 echo ""

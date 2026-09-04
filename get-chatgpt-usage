@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+set -eu
+
+# Cheapest possible check, before any temp dirs, network calls, or account
+# scanning: if the `codex` binary genuinely isn't installed, this Source
+# isn't just logged out, it's not present at all. Distinct from CREDS_STATUS
+# "missing"/"expired" (binary present, bad/no credentials) — drives the
+# widget hiding the ring and login card instead of offering a login button
+# that would spawn a nonexistent binary.
+#
+# `command -v` alone isn't reliable here: this script is spawned by
+# quickshell/DMS, whose PATH is typically a bare `/usr/local/bin:/usr/bin`
+# (no login-shell PATH additions), so a `codex` installed under
+# ~/.npm-global/bin, ~/.local/bin, nvm/volta/asdf shims, etc. would falsely
+# read as "not installed". Widen the search PATH with the common install
+# locations, and treat an existing auth file as proof of installation
+# regardless of PATH (if it's there, `codex` was run to create it).
+if ! PATH="${PATH}:${HOME}/.local/bin:${HOME}/.npm-global/bin:${HOME}/bin:${HOME}/go/bin:${HOME}/.cargo/bin:${HOME}/.volta/bin" command -v codex >/dev/null 2>&1 \
+    && [ ! -f "${CODEX_HOME:-${HOME}/.codex}/auth.json" ]; then
+    cat <<'NOTINSTALLED'
+PLAN_TYPE=unknown
+PRIMARY_UTIL=0
+PRIMARY_RESET=
+PRIMARY_WINDOW_SECONDS=0
+SECONDARY_UTIL=0
+SECONDARY_RESET=
+SECONDARY_WINDOW_SECONDS=0
+CREDITS_BALANCE=0
+CREDITS_HAS=false
+CREDS_STATUS=not_installed
+WEEK_TOKENS=0
+WEEK_MESSAGES=0
+WEEK_SESSIONS=0
+MONTH_TOKENS=0
+DAILY=0,0,0,0,0,0,0
+WEEK_MODELS=
+ACCOUNTS=
+ACCOUNT_PLAN=
+ACCOUNT_PRIMARY_UTIL=
+ACCOUNT_PRIMARY_RESET=
+ACCOUNT_SECONDARY_UTIL=
+ACCOUNT_SECONDARY_RESET=
+ACCOUNT_CREDITS_BALANCE=
+ACCOUNT_CREDS_STATUS=
+ACCOUNT_WEEK_TOKENS=
+ACCOUNT_MONTH_TOKENS=
+ACCOUNT_WEEK_MESSAGES=
+ACCOUNT_WEEK_SESSIONS=
+ACCOUNT_DAILY=
+ACCOUNT_WEEK_MODELS=
+NOTINSTALLED
+    exit 0
+fi
+
+STALE_REFRESH_DAYS=8
+STALE_EXP_SECONDS=300  # 5 minutes, mirrors CodexBar's own staleness rule
+
+# Calendar week: Monday to Sunday
+DOW=$(date +%u)  # 1=Monday, 7=Sunday
+WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
+# Calendar month: 1st of current month
+MONTH_START=$(date +%Y-%m-01)
+
+# Local vs UTC date bucketing — same probe/expression as get-claude-usage,
+# see that script for the full rationale. $ts is a jq variable set at each
+# call site, not a shell variable.
+# shellcheck disable=SC2016
+if jq -rn '"2020-01-01T00:00:00Z"[:19] + "Z" | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime | strflocaltime("%Y-%m-%d")' >/dev/null 2>&1; then
+    JQ_DATE_EXPR='(try (($ts[:19] + "Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime | strflocaltime("%Y-%m-%d")) catch (if ($ts | length) >= 10 then $ts[:10] else "1970-01-01" end))'
+else
+    JQ_DATE_EXPR='(if ($ts | length) >= 10 then $ts[:10] else "1970-01-01" end)'
+fi
+
+# --- Decode a JWT's `exp` claim without touching the signature ---
+jwt_exp() {
+    local token="$1" payload mod
+    payload=$(echo "$token" | cut -d. -f2)
+    mod=$(( ${#payload} % 4 ))
+    if [ "$mod" -eq 2 ]; then payload="${payload}=="
+    elif [ "$mod" -eq 3 ]; then payload="${payload}="
+    fi
+    payload=$(echo "$payload" | tr -- '-_' '+/')
+    echo "$payload" | base64 -d 2>/dev/null | jq -r '.exp // 0' 2>/dev/null || echo 0
+}
+
+# --- Per-account token/model stats from local rollout session files ---
+# Usage: count_account_tokens <codex_home_dir> <out_tmpfile>
+# Writes WEEK_TOKENS, WEEK_MESSAGES, WEEK_SESSIONS, MONTH_TOKENS, DAILY,
+# WEEK_MODELS to out_tmpfile. Mirrors get-claude-usage's count_profile_tokens,
+# but reads Codex's rollout-*.jsonl session logs instead of project transcripts:
+# each turn's `turn_context` event carries the active model, and `token_count`
+# events under it carry that step's token delta (payload.info.last_token_usage).
+count_account_tokens() {
+    local sessions_dir="$1"
+    local out_file="$2"
+
+    local day_dates=""
+    for i in $(seq 0 6); do
+        local d
+        d=$(date -d "$WEEK_START + ${i} days" +%Y-%m-%d)
+        day_dates="${day_dates:+${day_dates},}${d}"
+    done
+
+    # -R + fromjson? (rather than -n's default structured `inputs`, which
+    # aborts the entire batch of files on the first unparseable line, e.g.
+    # a rollout truncated mid-write) so one bad line only drops that line.
+    find "$sessions_dir" -name "*.jsonl" -mtime -31 -print0 2>/dev/null \
+        | xargs -0 -r jq -n -R -r "
+            foreach inputs as \$line (
+                {model:\"unknown\", file:null};
+                (try (\$line | fromjson) catch null) as \$item
+                | if \$item == null then
+                    . + {emit:null}
+                  else
+                    (input_filename) as \$f
+                    | (if \$f != .file then {model:\"unknown\", file:\$f} else {model:.model, file:.file} end) as \$carry
+                    | if \$item.type == \"turn_context\" then
+                        \$carry + {model: (\$item.payload.model // \$carry.model), emit: {k:\"turn\", ts:\$item.timestamp, model:(\$item.payload.model // \$carry.model), file:\$carry.file}}
+                      elif \$item.type == \"event_msg\" and \$item.payload.type == \"token_count\" then
+                        \$carry + {emit: {k:\"tok\", ts:\$item.timestamp, model:\$carry.model, tokens:(\$item.payload.info.last_token_usage.total_tokens // 0), file:\$carry.file}}
+                      else
+                        \$carry + {emit:null}
+                      end
+                  end;
+                .emit
+            )
+            | select(. != null)
+            | (.ts) as \$ts
+            | (${JQ_DATE_EXPR}) as \$d
+            | [.k, \$d, .model, (.tokens // 0 | tostring), .file] | @tsv
+        " 2>/dev/null \
+        | awk -F'\t' -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$day_dates" '
+        BEGIN { split(day_dates, dates, ",") }
+        {
+            kind = $1; date = $2; model = $3; tok = $4 + 0; file = $5
+
+            if (kind == "turn") {
+                if (date >= week_start) week_msgs++
+            } else if (kind == "tok") {
+                day[date] += tok
+                if (date >= week_start) {
+                    week_model[model] += tok
+                    week_tokens += tok
+                    sess_seen[file] = 1
+                }
+                if (date >= month_start) month_tokens += tok
+            }
+        }
+        END {
+            printf "WEEK_TOKENS=%d\n", week_tokens + 0
+            printf "WEEK_MESSAGES=%d\n", week_msgs + 0
+            n = 0; for (s in sess_seen) n++
+            printf "WEEK_SESSIONS=%d\n", n
+            printf "MONTH_TOKENS=%d\n", month_tokens + 0
+
+            daily = ""
+            for (i = 1; i <= 7; i++) {
+                val = (dates[i] in day) ? day[dates[i]] : 0
+                daily = daily (i > 1 ? "," : "") val + 0
+            }
+            printf "DAILY=%s\n", daily
+
+            models = ""
+            first = 1
+            for (m in week_model) {
+                if (week_model[m] > 0) {
+                    models = models (first ? "" : ",") m "=" week_model[m]
+                    first = 0
+                }
+            }
+            printf "WEEK_MODELS=%s\n", models
+        }' > "$out_file" 2>/dev/null || true
+
+    # Defaults if the pipeline produced nothing (no session files, jq/awk failure)
+    [ -s "$out_file" ] || printf 'WEEK_TOKENS=0\nWEEK_MESSAGES=0\nWEEK_SESSIONS=0\nMONTH_TOKENS=0\nDAILY=0,0,0,0,0,0,0\nWEEK_MODELS=\n' > "$out_file"
+}
+
+# --- Per-account credentials + usage fetcher ---
+# Usage: fetch_account_usage <codex_home_dir> <out_tmpfile>
+# Writes PLAN_TYPE, PRIMARY_UTIL, PRIMARY_RESET, PRIMARY_WINDOW_SECONDS,
+#        SECONDARY_UTIL, SECONDARY_RESET, SECONDARY_WINDOW_SECONDS,
+#        CREDITS_BALANCE, CREDITS_HAS, CREDS_STATUS to out_tmpfile
+fetch_account_usage() {
+    local codex_home="$1"
+    local out_file="$2"
+    local auth_file="${codex_home}/auth.json"
+
+    local plan_type="unknown"
+    local primary_util=0 primary_reset="" primary_window=0
+    local secondary_util=0 secondary_reset="" secondary_window=0
+    local credits_balance="0" credits_has="false"
+    # CREDS_STATUS: "ok" once a usage response is confirmed fresh, "expired"
+    # when a token exists but the API call failed to produce one, "missing"
+    # when there's no auth file (or no usable token in it) to even try.
+    local creds_status="unknown"
+
+    write_out() {
+        printf 'PLAN_TYPE=%s\nPRIMARY_UTIL=%s\nPRIMARY_RESET=%s\nPRIMARY_WINDOW_SECONDS=%s\nSECONDARY_UTIL=%s\nSECONDARY_RESET=%s\nSECONDARY_WINDOW_SECONDS=%s\nCREDITS_BALANCE=%s\nCREDITS_HAS=%s\nCREDS_STATUS=%s\n' \
+            "$plan_type" "$primary_util" "$primary_reset" "$primary_window" \
+            "$secondary_util" "$secondary_reset" "$secondary_window" \
+            "$credits_balance" "$credits_has" "$creds_status" > "$out_file"
+    }
+
+    if [ ! -f "$auth_file" ]; then
+        creds_status="missing"
+        write_out
+        return
+    fi
+
+    local token account_id last_refresh
+    token=$(jq -r '.tokens.access_token // ""' "$auth_file" 2>/dev/null || echo "")
+    account_id=$(jq -r '.tokens.account_id // ""' "$auth_file" 2>/dev/null || echo "")
+    last_refresh=$(jq -r '.last_refresh // ""' "$auth_file" 2>/dev/null || echo "")
+
+    if [ -z "$token" ] || [ -z "$account_id" ]; then
+        creds_status="missing"
+        write_out
+        return
+    fi
+
+    # Stale per CodexBar's rule: last_refresh older than 8 days, or the JWT's
+    # own exp within 5 minutes. Never refresh the token ourselves here (races
+    # the `codex` CLI's own writer) — shell out to `codex login status` once,
+    # which triggers Codex's normal startup refresh if it decides one is due.
+    local stale=false now_ts
+    now_ts=$(date +%s)
+    if [ -n "$last_refresh" ]; then
+        local refresh_ts age_days
+        refresh_ts=$(date -d "$last_refresh" +%s 2>/dev/null || echo 0)
+        age_days=$(( (now_ts - refresh_ts) / 86400 ))
+        [ "$age_days" -ge "$STALE_REFRESH_DAYS" ] && stale=true
+    fi
+    local exp
+    exp=$(jwt_exp "$token")
+    if [[ "$exp" =~ ^[0-9]+$ ]] && [ "$exp" -gt 0 ] && [ $(( exp - now_ts )) -le "$STALE_EXP_SECONDS" ]; then
+        stale=true
+    fi
+
+    if [ "$stale" = true ]; then
+        CODEX_HOME="$codex_home" timeout 15 codex login status >/dev/null 2>&1 || true
+        token=$(jq -r '.tokens.access_token // ""' "$auth_file" 2>/dev/null || echo "$token")
+        account_id=$(jq -r '.tokens.account_id // ""' "$auth_file" 2>/dev/null || echo "$account_id")
+    fi
+
+    local api_resp
+    api_resp=$(curl -s --max-time 5 \
+        -H "Authorization: Bearer $token" \
+        -H "ChatGPT-Account-Id: $account_id" \
+        -H "User-Agent: codex-cli" \
+        "https://chatgpt.com/backend-api/wham/usage" 2>/dev/null || echo '{}')
+
+    if echo "$api_resp" | jq -e '.rate_limit' >/dev/null 2>&1; then
+        creds_status="ok"
+        plan_type=$(echo "$api_resp" | jq -r '.plan_type // "unknown"')
+        primary_util=$(echo "$api_resp" | jq -r '.rate_limit.primary_window.used_percent // 0')
+        primary_reset=$(echo "$api_resp" | jq -r '.rate_limit.primary_window.reset_at // ""')
+        primary_window=$(echo "$api_resp" | jq -r '.rate_limit.primary_window.limit_window_seconds // 0')
+        secondary_util=$(echo "$api_resp" | jq -r '.rate_limit.secondary_window.used_percent // 0')
+        secondary_reset=$(echo "$api_resp" | jq -r '.rate_limit.secondary_window.reset_at // ""')
+        secondary_window=$(echo "$api_resp" | jq -r '.rate_limit.secondary_window.limit_window_seconds // 0')
+        credits_balance=$(echo "$api_resp" | jq -r '.credits.balance // "0"')
+        credits_has=$(echo "$api_resp" | jq -r '.credits.has_credits // false')
+    else
+        creds_status="expired"
+    fi
+
+    write_out
+}
+
+# --- Collect account list ---
+ACCOUNT_NAMES=()
+ACCOUNT_DIRS=()  # codex home dir per account
+
+# add_account <name> <codex_home_dir>
+# First registration of a name wins.
+add_account() {
+    local name="$1" dir="$2"
+
+    # , | : are output delimiters, they cannot survive in an account name
+    name="${name//[,|:]/}"
+    [ -n "$name" ] || return 0
+    [ -n "$dir" ] || return 0
+
+    case "$dir" in
+        [~]/*) dir="${HOME}/${dir#*/}" ;;
+        [~]) dir="$HOME" ;;
+    esac
+    dir="${dir%/}"
+
+    local existing existing_dir
+    for existing in "${ACCOUNT_NAMES[@]:-}"; do
+        [ "$existing" = "$name" ] && return 0
+    done
+    for existing_dir in "${ACCOUNT_DIRS[@]:-}"; do
+        [ "$existing_dir" = "$dir" ] && return 0
+    done
+
+    ACCOUNT_NAMES+=("$name")
+    ACCOUNT_DIRS+=("$dir")
+}
+
+add_account "default" "${CODEX_HOME:-${HOME}/.codex}"
+
+# Manual entries from plugin settings: "name=/path/to/codex/home", same
+# convention as get-claude-usage's manual profile entries.
+for arg in "$@"; do
+    case "$arg" in
+        *=*) add_account "${arg%%=*}" "${arg#*=}" ;;
+    esac
+done
+
+# --- Fetch usage per account in parallel ---
+TMPDIR_ROOT=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_ROOT"' EXIT
+
+USAGE_TMPFILES=()
+TOKENS_TMPFILES=()
+PIDS=()
+
+for idx in "${!ACCOUNT_DIRS[@]}"; do
+    usage_tmpf=$(mktemp "$TMPDIR_ROOT/account_XXXXXX")
+    tokens_tmpf=$(mktemp "$TMPDIR_ROOT/tokens_XXXXXX")
+    USAGE_TMPFILES+=("$usage_tmpf")
+    TOKENS_TMPFILES+=("$tokens_tmpf")
+    fetch_account_usage "${ACCOUNT_DIRS[$idx]}" "$usage_tmpf" &
+    PIDS+=("$!")
+    count_account_tokens "${ACCOUNT_DIRS[$idx]}/sessions" "$tokens_tmpf" &
+    PIDS+=("$!")
+done
+
+for pid in "${PIDS[@]:-}"; do
+    [ -n "$pid" ] && wait "$pid" || true
+done
+
+# --- Read per-account results, build aggregate (default account) + lists ---
+PLAN_TYPE="unknown"
+PRIMARY_UTIL=0
+PRIMARY_RESET=""
+PRIMARY_WINDOW_SECONDS=0
+SECONDARY_UTIL=0
+SECONDARY_RESET=""
+SECONDARY_WINDOW_SECONDS=0
+CREDITS_BALANCE="0"
+CREDITS_HAS="false"
+CREDS_STATUS="missing"
+WEEK_TOKENS=0
+WEEK_MESSAGES=0
+WEEK_SESSIONS=0
+MONTH_TOKENS=0
+DAILY="0,0,0,0,0,0,0"
+WEEK_MODELS=""
+
+ACCOUNT_PLAN_LIST=""
+ACCOUNT_PRIMARY_UTIL_LIST=""
+ACCOUNT_PRIMARY_RESET_LIST=""
+ACCOUNT_SECONDARY_UTIL_LIST=""
+ACCOUNT_SECONDARY_RESET_LIST=""
+ACCOUNT_CREDITS_BALANCE_LIST=""
+ACCOUNT_CREDS_STATUS_LIST=""
+ACCOUNT_WEEK_TOKENS_LIST=""
+ACCOUNT_MONTH_TOKENS_LIST=""
+ACCOUNT_WEEK_MESSAGES_LIST=""
+ACCOUNT_WEEK_SESSIONS_LIST=""
+ACCOUNT_DAILY_LIST=""
+ACCOUNT_WEEK_MODELS_LIST=""
+
+DAILY_ARR=(0 0 0 0 0 0 0)
+
+for idx in "${!USAGE_TMPFILES[@]}"; do
+    usage_tmpf="${USAGE_TMPFILES[$idx]}"
+    tokens_tmpf="${TOKENS_TMPFILES[$idx]}"
+    aname="${ACCOUNT_NAMES[$idx]}"
+    [ -f "$usage_tmpf" ] || continue
+
+    a_plan="unknown"
+    a_pu=0; a_pr=""; a_pw=0
+    a_su=0; a_sr=""; a_sw=0
+    a_cb="0"; a_ch="false"; a_cs="missing"
+
+    a_plan=$(grep "^PLAN_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
+    a_pu=$(grep "^PRIMARY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    a_pr=$(grep "^PRIMARY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+    a_pw=$(grep "^PRIMARY_WINDOW_SECONDS=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    a_su=$(grep "^SECONDARY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    a_sr=$(grep "^SECONDARY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+    a_sw=$(grep "^SECONDARY_WINDOW_SECONDS=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+    a_cb=$(grep "^CREDITS_BALANCE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "0")
+    a_ch=$(grep "^CREDITS_HAS=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
+    a_cs=$(grep "^CREDS_STATUS=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "missing")
+
+    a_wt=0; a_wm=0; a_ws=0; a_mt=0; a_daily="0,0,0,0,0,0,0"; a_models=""
+    if [ -f "$tokens_tmpf" ]; then
+        a_wt=$(grep "^WEEK_TOKENS=" "$tokens_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        a_wm=$(grep "^WEEK_MESSAGES=" "$tokens_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        a_ws=$(grep "^WEEK_SESSIONS=" "$tokens_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        a_mt=$(grep "^MONTH_TOKENS=" "$tokens_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
+        a_daily=$(grep "^DAILY=" "$tokens_tmpf" 2>/dev/null | cut -d= -f2- || echo "0,0,0,0,0,0,0")
+        a_models=$(grep "^WEEK_MODELS=" "$tokens_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+    fi
+
+    if [ "$aname" = "default" ]; then
+        PLAN_TYPE="$a_plan"
+        PRIMARY_UTIL="$a_pu"
+        PRIMARY_RESET="$a_pr"
+        PRIMARY_WINDOW_SECONDS="$a_pw"
+        SECONDARY_UTIL="$a_su"
+        SECONDARY_RESET="$a_sr"
+        SECONDARY_WINDOW_SECONDS="$a_sw"
+        CREDITS_BALANCE="$a_cb"
+        CREDITS_HAS="$a_ch"
+        CREDS_STATUS="$a_cs"
+    fi
+
+    # Aggregate token totals across all accounts
+    WEEK_TOKENS=$(( WEEK_TOKENS + a_wt ))
+    WEEK_MESSAGES=$(( WEEK_MESSAGES + a_wm ))
+    WEEK_SESSIONS=$(( WEEK_SESSIONS + a_ws ))
+    MONTH_TOKENS=$(( MONTH_TOKENS + a_mt ))
+
+    DAILY=$(echo "$a_daily" | awk -v cur="$(IFS=,; echo "${DAILY_ARR[*]}")" '
+        BEGIN { split(cur, a, ",") }
+        { split($0, b, ","); for(i=1;i<=7;i++) a[i]+=b[i]+0 }
+        END { for(i=1;i<=7;i++) printf "%s%s", (i>1?",":""), a[i]+0; print "" }
+    ')
+    IFS=',' read -ra DAILY_ARR <<< "$DAILY"
+
+    ACCOUNT_PLAN_LIST="${ACCOUNT_PLAN_LIST:+${ACCOUNT_PLAN_LIST},}${aname}:${a_plan}"
+    ACCOUNT_PRIMARY_UTIL_LIST="${ACCOUNT_PRIMARY_UTIL_LIST:+${ACCOUNT_PRIMARY_UTIL_LIST},}${aname}:${a_pu}"
+    ACCOUNT_PRIMARY_RESET_LIST="${ACCOUNT_PRIMARY_RESET_LIST:+${ACCOUNT_PRIMARY_RESET_LIST},}${aname}:${a_pr}"
+    ACCOUNT_SECONDARY_UTIL_LIST="${ACCOUNT_SECONDARY_UTIL_LIST:+${ACCOUNT_SECONDARY_UTIL_LIST},}${aname}:${a_su}"
+    ACCOUNT_SECONDARY_RESET_LIST="${ACCOUNT_SECONDARY_RESET_LIST:+${ACCOUNT_SECONDARY_RESET_LIST},}${aname}:${a_sr}"
+    ACCOUNT_CREDITS_BALANCE_LIST="${ACCOUNT_CREDITS_BALANCE_LIST:+${ACCOUNT_CREDITS_BALANCE_LIST},}${aname}:${a_cb}"
+    ACCOUNT_CREDS_STATUS_LIST="${ACCOUNT_CREDS_STATUS_LIST:+${ACCOUNT_CREDS_STATUS_LIST},}${aname}:${a_cs}"
+    ACCOUNT_WEEK_TOKENS_LIST="${ACCOUNT_WEEK_TOKENS_LIST:+${ACCOUNT_WEEK_TOKENS_LIST},}${aname}:${a_wt}"
+    ACCOUNT_MONTH_TOKENS_LIST="${ACCOUNT_MONTH_TOKENS_LIST:+${ACCOUNT_MONTH_TOKENS_LIST},}${aname}:${a_mt}"
+    ACCOUNT_WEEK_MESSAGES_LIST="${ACCOUNT_WEEK_MESSAGES_LIST:+${ACCOUNT_WEEK_MESSAGES_LIST},}${aname}:${a_wm}"
+    ACCOUNT_WEEK_SESSIONS_LIST="${ACCOUNT_WEEK_SESSIONS_LIST:+${ACCOUNT_WEEK_SESSIONS_LIST},}${aname}:${a_ws}"
+    ACCOUNT_DAILY_LIST="${ACCOUNT_DAILY_LIST:+${ACCOUNT_DAILY_LIST}|}${aname}:${a_daily}"
+    ACCOUNT_WEEK_MODELS_LIST="${ACCOUNT_WEEK_MODELS_LIST:+${ACCOUNT_WEEK_MODELS_LIST}|}${aname}:${a_models}"
+
+    rm -f "$usage_tmpf" "$tokens_tmpf"
+done
+
+ACCOUNTS=$(IFS=,; echo "${ACCOUNT_NAMES[*]}")
+
+WEEK_MODELS=$(echo "$ACCOUNT_WEEK_MODELS_LIST" | tr '|' '\n' | cut -d: -f2- | tr ',' '\n' | grep '=' | \
+    awk -F= '{ acc[$1]+=$2 } END { first=1; for(m in acc) { printf "%s%s=%d", (first?"":","),(m),(acc[m]+0); first=0 } print "" }')
+
+echo "PLAN_TYPE=${PLAN_TYPE}"
+echo "PRIMARY_UTIL=${PRIMARY_UTIL}"
+echo "PRIMARY_RESET=${PRIMARY_RESET}"
+echo "PRIMARY_WINDOW_SECONDS=${PRIMARY_WINDOW_SECONDS}"
+echo "SECONDARY_UTIL=${SECONDARY_UTIL}"
+echo "SECONDARY_RESET=${SECONDARY_RESET}"
+echo "SECONDARY_WINDOW_SECONDS=${SECONDARY_WINDOW_SECONDS}"
+echo "CREDITS_BALANCE=${CREDITS_BALANCE}"
+echo "CREDITS_HAS=${CREDITS_HAS}"
+echo "CREDS_STATUS=${CREDS_STATUS}"
+echo "WEEK_TOKENS=${WEEK_TOKENS}"
+echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
+echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
+echo "MONTH_TOKENS=${MONTH_TOKENS}"
+echo "DAILY=${DAILY}"
+echo "WEEK_MODELS=${WEEK_MODELS}"
+echo "ACCOUNTS=${ACCOUNTS}"
+echo "ACCOUNT_PLAN=${ACCOUNT_PLAN_LIST}"
+echo "ACCOUNT_PRIMARY_UTIL=${ACCOUNT_PRIMARY_UTIL_LIST}"
+echo "ACCOUNT_PRIMARY_RESET=${ACCOUNT_PRIMARY_RESET_LIST}"
+echo "ACCOUNT_SECONDARY_UTIL=${ACCOUNT_SECONDARY_UTIL_LIST}"
+echo "ACCOUNT_SECONDARY_RESET=${ACCOUNT_SECONDARY_RESET_LIST}"
+echo "ACCOUNT_CREDITS_BALANCE=${ACCOUNT_CREDITS_BALANCE_LIST}"
+echo "ACCOUNT_CREDS_STATUS=${ACCOUNT_CREDS_STATUS_LIST}"
+echo "ACCOUNT_WEEK_TOKENS=${ACCOUNT_WEEK_TOKENS_LIST}"
+echo "ACCOUNT_MONTH_TOKENS=${ACCOUNT_MONTH_TOKENS_LIST}"
+echo "ACCOUNT_WEEK_MESSAGES=${ACCOUNT_WEEK_MESSAGES_LIST}"
+echo "ACCOUNT_WEEK_SESSIONS=${ACCOUNT_WEEK_SESSIONS_LIST}"
+echo "ACCOUNT_DAILY=${ACCOUNT_DAILY_LIST}"
+echo "ACCOUNT_WEEK_MODELS=${ACCOUNT_WEEK_MODELS_LIST}"

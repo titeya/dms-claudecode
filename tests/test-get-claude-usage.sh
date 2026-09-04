@@ -38,9 +38,19 @@ chmod +x "$mock_curl"
 run_script() {
     local home_dir="$1"
     shift
-    # Override HOME and prepend mock curl to PATH; remaining args go to the script
+    # Override HOME and prepend mock curl/claude to PATH; remaining args go to the script
     HOME="$home_dir" PATH="$TMPDIR_ROOT:$PATH" bash "$SCRIPT" "$@" 2>/dev/null
 }
+
+# Fake `claude` binary — only its presence on PATH is checked by most tests,
+# so the not_installed short-circuit doesn't fire in the common case. A test
+# exercising not_installed removes it from PATH instead.
+mock_claude="$TMPDIR_ROOT/claude"
+cat > "$mock_claude" << 'CLAUDEEOF'
+#!/usr/bin/env bash
+echo "2.0.0 (Claude Code)"
+CLAUDEEOF
+chmod +x "$mock_claude"
 
 # Build a JSONL fixture line
 # Usage: make_jsonl_line <date> <model> <input> <output> <cache_read> <cache_write> <sessionId>

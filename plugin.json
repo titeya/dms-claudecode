@@ -1,8 +1,8 @@
 {
-  "id": "claudeCodeUsage",
-  "name": "Claude Code Usage",
-  "description": "Monitor your Claude Code subscription usage with token tracking, estimated API costs, rate limits, and daily activity charts",
-  "version": "1.3.5",
+  "id": "aiUsage",
+  "name": "AI Usage",
+  "description": "Monitor your Claude and ChatGPT/Codex usage with token tracking, estimated API costs, rate limits, and daily activity charts",
+  "version": "1.4.0",
   "author": "Nicolas Bellamy",
   "icon": "monitoring",
   "type": "widget",
