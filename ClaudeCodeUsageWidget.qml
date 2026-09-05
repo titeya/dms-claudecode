@@ -217,6 +217,14 @@ PluginComponent {
             // Large gap (>2min) indicates wake from sleep — force immediate refresh
             if (elapsed > 120000 && !usageProcess.running) {
                 usageProcess.running = true;
+            } else if (!usageProcess.running) {
+                // A window's reset time has just passed locally — don't sit on
+                // "Resetting..." until the next scheduled poll, fetch the new
+                // resets_at right away.
+                var fiveExpired = root.fiveHourReset && new Date(root.fiveHourReset).getTime() <= now;
+                var sevenExpired = root.sevenDayReset && new Date(root.sevenDayReset).getTime() <= now;
+                if (fiveExpired || sevenExpired)
+                    usageProcess.running = true;
             }
         }
     }

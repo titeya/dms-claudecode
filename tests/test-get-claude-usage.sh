@@ -716,6 +716,59 @@ else
 fi
 
 # ============================================================
+echo "=== Test 28: Usage API cache — stale fallback bounded ==="
+# ============================================================
+ENV28=$(setup_env "test28")
+
+cat > "$ENV28/.claude/.credentials.json" << 'CREDEOF'
+{
+    "claudeAiOauth": {
+        "subscriptionType": "pro",
+        "rateLimitTier": "t1_pro",
+        "accessToken": "fake-token"
+    }
+}
+CREDEOF
+
+# Cache is past the fast-path TTL but well within the stale-fallback window —
+# the live fetch (mocked to return {}) fails, so it should fall back to it.
+RECENT_TS=$(( $(date +%s) - 300 ))
+cat > "$ENV28/.claude/usage-cache.json" << CACHEEOF
+{
+    "cached_at": $RECENT_TS,
+    "identity": "$ENV28/.claude/.credentials.json",
+    "data": {
+        "five_hour": {"utilization": 77, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 20, "resets_at": "2099-01-07T00:00:00Z"},
+        "extra_usage": {"is_enabled": false}
+    }
+}
+CACHEEOF
+
+OUTPUT28=$(run_script "$ENV28")
+FIVE28=$(echo "$OUTPUT28" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)
+assert_eq "$FIVE28" "77" "Recently-stale cache used as fallback when live fetch fails"
+
+# Cache is far older than the stale-fallback window — the live fetch fails and
+# the ancient cache must NOT be served as if it were current data.
+ANCIENT_TS=$(( $(date +%s) - 7200 ))
+cat > "$ENV28/.claude/usage-cache.json" << CACHEEOF
+{
+    "cached_at": $ANCIENT_TS,
+    "identity": "$ENV28/.claude/.credentials.json",
+    "data": {
+        "five_hour": {"utilization": 100, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 20, "resets_at": "2099-01-07T00:00:00Z"},
+        "extra_usage": {"is_enabled": false}
+    }
+}
+CACHEEOF
+
+OUTPUT28B=$(run_script "$ENV28")
+FIVE28B=$(echo "$OUTPUT28B" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)
+assert_eq "$FIVE28B" "0" "Ancient cache is refused as fallback, not served as live"
+
+# ============================================================
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
