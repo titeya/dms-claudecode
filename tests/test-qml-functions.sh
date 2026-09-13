@@ -139,6 +139,28 @@ function parseLine(line, state) {
     }
     return state
 }
+
+// Minimal Qt shim for the countdown clock label
+var Qt = {
+    formatDateTime: function (date, fmt) {
+        var pad = function (n) { return (n < 10 ? "0" : "") + n }
+        var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        if (fmt === "ddd HH:mm")
+            return days[date.getDay()] + " " + pad(date.getHours()) + ":" + pad(date.getMinutes())
+        if (fmt === "yyyy-MM-dd")
+            return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate())
+        return pad(date.getHours()) + ":" + pad(date.getMinutes())
+    }
+}
+
+// resetClockLabel: local wall clock appended to countdowns
+function resetClockLabel(resetMs) {
+    var resetDate = new Date(resetMs)
+    var sameDay = Qt.formatDateTime(resetDate, "yyyy-MM-dd") === Qt.formatDateTime(new Date(), "yyyy-MM-dd")
+    if (!sameDay)
+        return " (" + Qt.formatDateTime(resetDate, "ddd HH:mm") + ")"
+    return " (" + Qt.formatDateTime(resetDate, "HH:mm") + ")"
+}
 '
 
 # ============================================================
@@ -426,6 +448,18 @@ else
 fi
 
 # ============================================================
+# ============================================================
+echo "=== Test 8: countdown clock labels ==="
+# ============================================================
+
+# A reset later today carries no date; a reset on another calendar day does.
+# Anchored to the real clock (23:59 today, now + 48h) so the branch taken is
+# the same whatever time or timezone the suite runs in.
+RESULT_TODAY=$(run_js "${JS_HARNESS} var d = new Date(); d.setHours(23, 59, 0, 0); console.log(resetClockLabel(d.getTime()))")
+RESULT_OTHERDAY=$(run_js "${JS_HARNESS} console.log(resetClockLabel(Date.now() + 48 * 3600000))")
+if echo "$RESULT_TODAY" | grep -qE '^ \([0-9]{2}:[0-9]{2}\)$'; then pass "same-calendar-day reset shows time only"; else fail "same-day label got '$RESULT_TODAY'"; fi
+if echo "$RESULT_OTHERDAY" | grep -qE '^ \([A-Za-z]{3} [0-9]{2}:[0-9]{2}\)$'; then pass "other-calendar-day reset includes the weekday"; else fail "other-day label got '$RESULT_OTHERDAY'"; fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -126,7 +126,7 @@ PluginComponent {
             return tr("Resetting...");
         var hours = Math.floor(remaining / 3600000);
         var mins = Math.floor((remaining % 3600000) / 60000);
-        return hours + "h " + (mins < 10 ? "0" : "") + mins + "m";
+        return hours + "h " + (mins < 10 ? "0" : "") + mins + "m" + resetClockLabel(resetMs);
     }
 
     property string displaySevenDayCountdown: {
@@ -140,8 +140,20 @@ PluginComponent {
         var hours = Math.floor((remaining % 86400000) / 3600000);
         var mins = Math.floor((remaining % 3600000) / 60000);
         if (days > 0)
-            return days + "d " + hours + "h " + (mins < 10 ? "0" : "") + mins + "m";
-        return hours + "h " + (mins < 10 ? "0" : "") + mins + "m";
+            return days + "d " + hours + "h " + (mins < 10 ? "0" : "") + mins + "m" + resetClockLabel(resetMs);
+        return hours + "h " + (mins < 10 ? "0" : "") + mins + "m" + resetClockLabel(resetMs);
+    }
+
+    // Local wall clock of a reset instant, appended to countdowns so they can
+    // be reconciled against dashboards that render resets in their own
+    // timezone. The date appears only when the reset falls on another
+    // calendar day.
+    function resetClockLabel(resetMs) {
+        var resetDate = new Date(resetMs);
+        var sameDay = Qt.formatDateTime(resetDate, "yyyy-MM-dd") === Qt.formatDateTime(new Date(), "yyyy-MM-dd");
+        if (!sameDay)
+            return " (" + Qt.formatDateTime(resetDate, "ddd HH:mm") + ")";
+        return " (" + Qt.formatDateTime(resetDate, "HH:mm") + ")";
     }
 
     // Pacing: whether usage is ahead of (over) or behind (under) a linear burn
