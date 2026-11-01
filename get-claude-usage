@@ -24,6 +24,7 @@ SUBSCRIPTION_TYPE="unknown"
 RATE_LIMIT_TIER="unknown"
 FIVE_HOUR_UTIL=0
 FIVE_HOUR_RESET=""
+FIVE_HOUR_ENABLED="true"
 SEVEN_DAY_UTIL=0
 SEVEN_DAY_RESET=""
 EXTRA_USAGE_ENABLED="false"
@@ -259,7 +260,7 @@ count_profile_tokens() {
 
 # --- Per-profile credentials + API usage fetcher ---
 # Usage: fetch_profile_usage <credentials_file> <cache_file> <out_tmpfile>
-# Writes SUBSCRIPTION_TYPE, RATE_LIMIT_TIER, FIVE_HOUR_UTIL, FIVE_HOUR_RESET,
+# Writes SUBSCRIPTION_TYPE, RATE_LIMIT_TIER, FIVE_HOUR_UTIL, FIVE_HOUR_RESET, FIVE_HOUR_ENABLED,
 #        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED, AUTH_STATE to out_tmpfile
 # AUTH_STATE: ok | missing | expired | rate_limited | stale
 #   ok            live (or fresh-cache) response
@@ -274,12 +275,12 @@ fetch_profile_usage() {
 
     local sub_type="unknown"
     local tier="unknown"
-    local five_util=0 five_reset="" seven_util=0 seven_reset="" extra="false"
+    local five_util=0 five_reset="" five_enabled="true" seven_util=0 seven_reset="" extra="false"
     local auth_state="missing"
 
     if [ ! -f "$creds_file" ]; then
-        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nAUTH_STATE=%s\n' \
-            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$auth_state" > "$out_file"
+        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nFIVE_HOUR_ENABLED=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nAUTH_STATE=%s\n' \
+            "$sub_type" "$tier" "$five_util" "$five_reset" "$five_enabled" "$seven_util" "$seven_reset" "$extra" "$auth_state" > "$out_file"
         return
     fi
 
@@ -326,7 +327,7 @@ fetch_profile_usage() {
             api_resp="${raw%$'\n'*}"
             [ -n "$api_resp" ] || api_resp='{}'
 
-            if echo "$api_resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+            if echo "$api_resp" | jq -e '.five_hour // .seven_day' >/dev/null 2>&1; then
                 auth_state="ok"
                 # Write atomically: overlapping widget refreshes both target the
                 # same cache file, and a plain `> "$cache_file"` interleaves their
@@ -361,12 +362,15 @@ fetch_profile_usage() {
 
     five_util=$(echo "$api_resp" | jq -r '.five_hour.utilization // 0')
     five_reset=$(echo "$api_resp" | jq -r '.five_hour.resets_at // ""')
+    # Plans without a 5-hour limit get "five_hour": null. {} means no data, not
+    # no limit, and an idle window can have no resets_at, so neither counts.
+    five_enabled=$(echo "$api_resp" | jq -r '.five_hour != null or . == {}')
     seven_util=$(echo "$api_resp" | jq -r '.seven_day.utilization // 0')
     seven_reset=$(echo "$api_resp" | jq -r '.seven_day.resets_at // ""')
     extra=$(echo "$api_resp" | jq -r '.extra_usage.is_enabled // false')
 
-    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nAUTH_STATE=%s\n' \
-        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$auth_state" > "$out_file"
+    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nFIVE_HOUR_ENABLED=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nAUTH_STATE=%s\n' \
+        "$sub_type" "$tier" "$five_util" "$five_reset" "$five_enabled" "$seven_util" "$seven_reset" "$extra" "$auth_state" > "$out_file"
 }
 
 # --- Collect profile list ---
@@ -492,6 +496,7 @@ PROF_TIER_LIST=""
 PROF_FIVE_HOUR_UTIL=""
 PROF_SEVEN_DAY_UTIL=""
 PROF_FIVE_HOUR_RESET_LIST=""
+PROF_FIVE_HOUR_ENABLED_LIST=""
 PROF_SEVEN_DAY_RESET_LIST=""
 PROF_EXTRA_USAGE_LIST=""
 PROF_AUTH_STATE_LIST=""
@@ -516,12 +521,15 @@ for idx in "${!TMPFILES[@]}"; do
 
     # Read per-profile usage/subscription
     p_sub="unknown"; p_tier="unknown"
-    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"; p_auth="missing"
+    p_5u=0; p_5r=""; p_5e="true"; p_7u=0; p_7r=""; p_extra="false"; p_auth="missing"
     if [ -f "$usage_tmpf" ]; then
         p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
         p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
         p_5u=$(grep "^FIVE_HOUR_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
         p_5r=$(grep "^FIVE_HOUR_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
+        # A fetch that died leaves the file empty, and that must not read as "no limit"
+        p_5e=$(grep "^FIVE_HOUR_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2-)
+        p_5e="${p_5e:-true}"
         p_7u=$(grep "^SEVEN_DAY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
         p_7r=$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
         p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
@@ -534,6 +542,7 @@ for idx in "${!TMPFILES[@]}"; do
         RATE_LIMIT_TIER="$p_tier"
         FIVE_HOUR_UTIL="$p_5u"
         FIVE_HOUR_RESET="$p_5r"
+        FIVE_HOUR_ENABLED="$p_5e"
         SEVEN_DAY_UTIL="$p_7u"
         SEVEN_DAY_RESET="$p_7r"
         EXTRA_USAGE_ENABLED="$p_extra"
@@ -583,6 +592,7 @@ for idx in "${!TMPFILES[@]}"; do
     PROF_FIVE_HOUR_UTIL="${PROF_FIVE_HOUR_UTIL:+${PROF_FIVE_HOUR_UTIL},}${pname}:${p_5u}"
     PROF_SEVEN_DAY_UTIL="${PROF_SEVEN_DAY_UTIL:+${PROF_SEVEN_DAY_UTIL},}${pname}:${p_7u}"
     PROF_FIVE_HOUR_RESET_LIST="${PROF_FIVE_HOUR_RESET_LIST:+${PROF_FIVE_HOUR_RESET_LIST},}${pname}:${p_5r}"
+    PROF_FIVE_HOUR_ENABLED_LIST="${PROF_FIVE_HOUR_ENABLED_LIST:+${PROF_FIVE_HOUR_ENABLED_LIST},}${pname}:${p_5e}"
     PROF_SEVEN_DAY_RESET_LIST="${PROF_SEVEN_DAY_RESET_LIST:+${PROF_SEVEN_DAY_RESET_LIST},}${pname}:${p_7r}"
     PROF_EXTRA_USAGE_LIST="${PROF_EXTRA_USAGE_LIST:+${PROF_EXTRA_USAGE_LIST},}${pname}:${p_extra}"
     PROF_AUTH_STATE_LIST="${PROF_AUTH_STATE_LIST:+${PROF_AUTH_STATE_LIST},}${pname}:${p_auth}"
@@ -610,6 +620,7 @@ echo "SUBSCRIPTION_TYPE=${SUBSCRIPTION_TYPE}"
 echo "RATE_LIMIT_TIER=${RATE_LIMIT_TIER}"
 echo "FIVE_HOUR_UTIL=${FIVE_HOUR_UTIL}"
 echo "FIVE_HOUR_RESET=${FIVE_HOUR_RESET}"
+echo "FIVE_HOUR_ENABLED=${FIVE_HOUR_ENABLED}"
 echo "SEVEN_DAY_UTIL=${SEVEN_DAY_UTIL}"
 echo "SEVEN_DAY_RESET=${SEVEN_DAY_RESET}"
 echo "EXTRA_USAGE_ENABLED=${EXTRA_USAGE_ENABLED}"
@@ -644,6 +655,7 @@ echo "PROFILE_WEEK_MODELS=${PROF_WEEK_MODELS_LIST}"
 echo "PROFILE_FIVE_HOUR_UTIL=${PROF_FIVE_HOUR_UTIL}"
 echo "PROFILE_SEVEN_DAY_UTIL=${PROF_SEVEN_DAY_UTIL}"
 echo "PROFILE_FIVE_HOUR_RESET=${PROF_FIVE_HOUR_RESET_LIST}"
+echo "PROFILE_FIVE_HOUR_ENABLED=${PROF_FIVE_HOUR_ENABLED_LIST}"
 echo "PROFILE_SEVEN_DAY_RESET=${PROF_SEVEN_DAY_RESET_LIST}"
 echo "PROFILE_EXTRA_USAGE=${PROF_EXTRA_USAGE_LIST}"
 echo "PROFILE_AUTH_STATE=${PROF_AUTH_STATE_LIST}"

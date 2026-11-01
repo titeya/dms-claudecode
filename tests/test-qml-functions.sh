@@ -140,6 +140,7 @@ function parseLine(line, state) {
     case "RATE_LIMIT_TIER": state.rateLimitTier = val; break
     case "FIVE_HOUR_UTIL": state.fiveHourUtil = parseFloat(val) || 0; break
     case "FIVE_HOUR_RESET": state.fiveHourReset = val; break
+    case "FIVE_HOUR_ENABLED": state.fiveHourEnabled = (val === "true"); break
     case "SEVEN_DAY_UTIL": state.sevenDayUtil = parseFloat(val) || 0; break
     case "SEVEN_DAY_RESET": state.sevenDayReset = val; break
     case "EXTRA_USAGE_ENABLED": state.extraUsageEnabled = (val === "true"); break
@@ -384,6 +385,7 @@ test_parse_line "EXTRA_USAGE_ENABLED=false" "extraUsageEnabled" 'false' "parseLi
 # Empty values default to 0
 test_parse_line "WEEK_TOKENS=" "weekTokens" '0' "parseLine empty value defaults to 0"
 test_parse_line "FIVE_HOUR_UTIL=" "fiveHourUtil" '0' "parseLine empty float defaults to 0"
+test_parse_line "FIVE_HOUR_ENABLED=false" "fiveHourEnabled" 'false' "parseLine FIVE_HOUR_ENABLED false"
 
 # No equals sign — ignored
 RESULT_NOEQUALS=$(run_js "${JS_HARNESS}
