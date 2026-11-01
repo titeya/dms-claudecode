@@ -36,6 +36,7 @@ PluginComponent {
     property string rateLimitTier: ""
     property real fiveHourUtil: 0
     property string fiveHourReset: ""
+    property bool fiveHourEnabled: true
     property real sevenDayUtil: 0
     property string sevenDayReset: ""
     property bool extraUsageEnabled: false
@@ -78,7 +79,7 @@ PluginComponent {
     property var profileData: ({})
     // Shape per profile: { weekTokens, monthTokens, todayCost, weekCost, monthCost,
     //   daily:[7], dailyCosts:[7], weekModels:[{modelName,modelTokens}],
-    //   fiveHourUtil, sevenDayUtil, fiveHourReset, sevenDayReset }
+    //   fiveHourUtil, sevenDayUtil, fiveHourReset, sevenDayReset, fiveHourEnabled }
 
     ListModel {
         id: profileListModel
@@ -101,6 +102,7 @@ PluginComponent {
     property string displayRateLimitTier: currentPd && currentPd.rateLimitTier ? currentPd.rateLimitTier : rateLimitTier
     property real displayFiveHourUtil: currentPd && currentPd.fiveHourUtil !== undefined ? currentPd.fiveHourUtil : fiveHourUtil
     property string displayFiveHourReset: currentPd && currentPd.fiveHourReset !== undefined ? currentPd.fiveHourReset : fiveHourReset
+    property bool displayFiveHourEnabled: currentPd && currentPd.fiveHourEnabled !== undefined ? currentPd.fiveHourEnabled : fiveHourEnabled
     property real displaySevenDayUtil: currentPd && currentPd.sevenDayUtil !== undefined ? currentPd.sevenDayUtil : sevenDayUtil
     property string displaySevenDayReset: currentPd && currentPd.sevenDayReset !== undefined ? currentPd.sevenDayReset : sevenDayReset
     property string displayAuthState: currentPd && currentPd.authState !== undefined ? currentPd.authState : authState
@@ -168,14 +170,16 @@ PluginComponent {
         void (countdownNow);
         return displayAuthOk ? paceInfo(displaySevenDayUtil, displaySevenDayReset, 604800000) : unknownPace;
     }
-    // Pills are not profile-scoped — derive from aggregate 5h values.
-    property var pillFivePace: {
+    // Pills are not profile-scoped — derive from aggregate 5h values, or 7-day
+    // ones on plans without a 5-hour limit.
+    readonly property real pillUtil: fiveHourEnabled ? fiveHourUtil : sevenDayUtil
+    property var pillPace: {
         void (countdownNow);
-        return paceInfo(fiveHourUtil, fiveHourReset, 18000000);
+        return fiveHourEnabled ? paceInfo(fiveHourUtil, fiveHourReset, 18000000) : paceInfo(sevenDayUtil, sevenDayReset, 604800000);
     }
     // Whether the taskbar pill should show the over-pace arrow/color. Shared by
     // the horizontal and vertical pills so they never diverge.
-    readonly property bool pillOverPace: showPacing && authOk && (pillFivePace.status === "over" || pillFivePace.status === "over_quota")
+    readonly property bool pillOverPace: showPacing && authOk && (pillPace.status === "over" || pillPace.status === "over_quota")
 
     // Today's index in the calendar week (0=Monday, 6=Sunday)
     property int todayIndex: {
@@ -495,6 +499,9 @@ PluginComponent {
         case "FIVE_HOUR_RESET":
             fiveHourReset = val;
             break;
+        case "FIVE_HOUR_ENABLED":
+            fiveHourEnabled = (val === "true");
+            break;
         case "SEVEN_DAY_UTIL":
             sevenDayUtil = parseFloat(val) || 0;
             break;
@@ -627,6 +634,9 @@ PluginComponent {
             break;
         case "PROFILE_FIVE_HOUR_RESET":
             profileData = parseProfileString(val, "fiveHourReset");
+            break;
+        case "PROFILE_FIVE_HOUR_ENABLED":
+            profileData = parseProfileBool(val, "fiveHourEnabled");
             break;
         case "PROFILE_SEVEN_DAY_RESET":
             profileData = parseProfileString(val, "sevenDayReset");
@@ -770,7 +780,7 @@ PluginComponent {
         }
     }
 
-    // --- Taskbar pills (show 5h utilization) ---
+    // --- Taskbar pills (show 5h utilization, 7-day without a 5-hour limit) ---
 
     horizontalBarPill: Component {
         Row {
@@ -784,7 +794,7 @@ PluginComponent {
                 anchors.verticalCenter: parent.verticalCenter
                 renderStrategy: Canvas.Cooperative
 
-                property real percent: root.fiveHourUtil
+                property real percent: root.pillUtil
                 onPercentChanged: requestPaint()
                 onWidthChanged: requestPaint()
 
@@ -812,9 +822,9 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.pillUtil) + "%" + (root.pillOverPace ? " ↑" : "")
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
-                color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
+                color: root.pillOverPace ? root.paceColor(root.pillPace.status) : Theme.surfaceText
                 anchors.verticalCenter: parent.verticalCenter
             }
         }
@@ -832,7 +842,7 @@ PluginComponent {
                 anchors.horizontalCenter: parent.horizontalCenter
                 renderStrategy: Canvas.Cooperative
 
-                property real percent: root.fiveHourUtil
+                property real percent: root.pillUtil
                 onPercentChanged: requestPaint()
                 onWidthChanged: requestPaint()
 
@@ -860,9 +870,9 @@ PluginComponent {
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%" + (root.pillOverPace ? " ↑" : "")
+                text: Math.round(root.pillUtil) + "%" + (root.pillOverPace ? " ↑" : "")
                 font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
-                color: root.pillOverPace ? root.paceColor(root.pillFivePace.status) : Theme.surfaceText
+                color: root.pillOverPace ? root.paceColor(root.pillPace.status) : Theme.surfaceText
                 anchors.horizontalCenter: parent.horizontalCenter
             }
         }
@@ -1059,6 +1069,7 @@ PluginComponent {
                     width: parent.width
                     height: fiveHourContent.implicitHeight + Theme.spacingS * 2
                     color: Theme.surfaceContainerHigh
+                    visible: root.displayFiveHourEnabled
 
                     Row {
                         id: fiveHourContent

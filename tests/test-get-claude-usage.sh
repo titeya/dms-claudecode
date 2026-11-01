@@ -931,6 +931,59 @@ assert_eq "$(usage_field "$OUTPUT39" WEEK_MESSAGES)" "2" "one deduplicated messa
 assert_match "$(usage_field "$OUTPUT39" PROFILE_WEEK_TOKENS)" "default:100,work:50" "profile totals stay independent"
 
 # ============================================================
+echo "=== Test 40: FIVE_HOUR_ENABLED — plans without a 5-hour limit ==="
+# ============================================================
+NO_FIVE_BODY='{"five_hour":null,"seven_day":{"utilization":7,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+IDLE_FIVE_BODY='{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":7,"resets_at":"2099-01-07T00:00:00Z"}}'
+
+ENV40=$(setup_env "test40")
+make_creds "$ENV40"
+cat > "$ENV40/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $OLD_TS, "identity": "$ENV40/.claude/.credentials.json", "data": $VALID_BODY}
+CACHEEOF
+OUTPUT40=$(MOCK_USAGE_BODY="$NO_FIVE_BODY" run_script "$ENV40")
+assert_eq "$(auth_state_of "$OUTPUT40")" "ok" "five_hour null: AUTH_STATE=ok, not stale"
+assert_eq "$(usage_field "$OUTPUT40" SEVEN_DAY_UTIL)" "7" "five_hour null: live 7-day value replaces the old cache"
+assert_eq "$(usage_field "$OUTPUT40" FIVE_HOUR_ENABLED)" "false" "five_hour null: FIVE_HOUR_ENABLED=false"
+assert_eq "$(usage_field "$OUTPUT40" PROFILE_FIVE_HOUR_ENABLED)" "default:false" "five_hour null: per-profile value emitted"
+assert_eq "$(jq -r '.data.seven_day.utilization' "$ENV40/.claude/usage-cache.json")" "7" "five_hour null: cache refreshed"
+
+cat > "$ENV40/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $OLD_TS, "identity": "$ENV40/.claude/.credentials.json", "data": $NO_FIVE_BODY}
+CACHEEOF
+OUTPUT40B=$(MOCK_USAGE_CODE=500 run_script "$ENV40")
+assert_eq "$(auth_state_of "$OUTPUT40B")" "stale" "cached five_hour null + failed call: AUTH_STATE=stale"
+assert_eq "$(usage_field "$OUTPUT40B" FIVE_HOUR_ENABLED)" "false" "cached five_hour null + failed call: stays false"
+
+ENV40C=$(setup_env "test40c")
+make_creds "$ENV40C"
+OUTPUT40C=$(MOCK_USAGE_BODY="$IDLE_FIVE_BODY" run_script "$ENV40C")
+assert_eq "$(usage_field "$OUTPUT40C" FIVE_HOUR_ENABLED)" "true" "idle window with no resets_at: FIVE_HOUR_ENABLED=true"
+
+ENV40D=$(setup_env "test40d")
+make_creds "$ENV40D"
+OUTPUT40D=$(MOCK_USAGE_BODY="$VALID_BODY" run_script "$ENV40D")
+assert_eq "$(usage_field "$OUTPUT40D" FIVE_HOUR_ENABLED)" "true" "populated window: FIVE_HOUR_ENABLED=true"
+
+ENV40E=$(setup_env "test40e")
+make_creds "$ENV40E"
+OUTPUT40E=$(MOCK_USAGE_CODE=500 run_script "$ENV40E")
+assert_eq "$(usage_field "$OUTPUT40E" FIVE_HOUR_ENABLED)" "true" "failed call with no cache: FIVE_HOUR_ENABLED stays true"
+
+ENV40F=$(setup_env "test40f")
+OUTPUT40F=$(run_script "$ENV40F")
+assert_eq "$(usage_field "$OUTPUT40F" FIVE_HOUR_ENABLED)" "true" "no credentials: FIVE_HOUR_ENABLED stays true"
+
+ENV40G=$(setup_env "test40g")
+make_creds "$ENV40G"
+cat > "$ENV40G/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $(date +%s), "identity": "$ENV40G/.claude/.credentials.json", "data": "corrupt"}
+CACHEEOF
+OUTPUT40G=$(run_script "$ENV40G")
+assert_eq "$(usage_field "$OUTPUT40G" FIVE_HOUR_ENABLED)" "true" "fetch died on a corrupt cache: FIVE_HOUR_ENABLED stays true"
+assert_eq "$(usage_field "$OUTPUT40G" PROFILE_FIVE_HOUR_ENABLED)" "default:true" "fetch died on a corrupt cache: per-profile value stays true"
+
+# ============================================================
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
